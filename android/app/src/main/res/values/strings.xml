@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">通知桥</string>
+    <string name="app_subtitle">把 Android 手机的通知，悄悄带到 Mac。</string>
+    <string name="app_pill">蓝牙直连 · 本地传输</string>
+
+    <string name="step_one_title">允许读取通知</string>
+    <string name="notification_access_granted">已授权，通知桥可以读取新通知</string>
+    <string name="notification_access_missing">尚未授权通知访问</string>
+    <string name="notification_hint">Android 只允许获得「通知访问」权限的应用读取通知。通知内容不会上传到服务器。</string>
+    <string name="manage_access">管理通知访问</string>
+    <string name="grant_access">去授权</string>
+
+    <string name="step_two_title">启动蓝牙同步</string>
+    <string name="service_running">同步服务运行中</string>
+    <string name="service_stopped">同步服务未启动</string>
+    <string name="connection_status_title">连接状态</string>
+    <string name="connection_not_running">启动同步后，这里会显示 Mac 连接状态</string>
+    <string name="connection_paired">Mac 已连接并配对，通知会实时同步</string>
+    <string name="connection_waiting_for_pin">Mac 已连接，等待输入配对码</string>
+    <string name="connection_waiting_for_mac">等待 Mac 连接</string>
+    <string name="bluetooth_title">蓝牙</string>
+    <string name="bluetooth_state_format">%1$s</string>
+    <string name="start_sync">启动同步</string>
+    <string name="stop_sync">停止同步</string>
+    <string name="refresh_pin">刷新配对码</string>
+    <string name="send_test_message">发送测试消息到 Mac</string>
+    <string name="toast_pair_first">请先在 Mac 上完成配对</string>
+    <string name="toast_test_sent">测试消息已发送</string>
+
+    <string name="pairing_label">Mac 连接配对码</string>
+    <string name="pairing_hint">在 Mac 菜单栏打开「通知桥」，点击连接手机后输入这 6 位数字。</string>
+    <string name="mac_hint_running">连接成功后，Mac 会以系统通知显示短信、微信等新消息。</string>
+    <string name="mac_hint_stopped">点击上方「启动同步」，再回到 Mac 完成连接。</string>
+
+    <string name="privacy_title">隐私</string>
+    <string name="privacy_body">通知内容只在手机与 Mac 的蓝牙连接中传输，不经过互联网，也不会写入服务器。配对码仅在当前连接中有效。</string>
+    <string name="limitations_title">限制</string>
+    <string name="limitations_body">iPhone 不适用：iOS 不允许第三方 App 读取系统通知。微信、短信等能否显示具体内容，取决于手机通知本身是否展示详情；部分系统会隐藏锁屏通知内容。</string>
+    <string name="version_footer">NotifyBridge 0.1 · Android 8.0+ · 需要一个蓝牙适配器正常的 Mac</string>
+
+    <string name="relay_channel_name">通知同步</string>
+    <string name="relay_channel_description">保持与 Mac 的低功耗蓝牙连接</string>
+
+    <string name="toast_enable_notification_access">请先开启通知访问权限</string>
+    <string name="toast_open_bluetooth_failed">无法打开蓝牙开关</string>
+    <string name="toast_service_starting">正在启动通知同步…</string>
+    <string name="toast_service_start_failed">启动失败：%1$s</string>
+    <string name="toast_start_first">请先启动同步服务</string>
+    <string name="toast_refresh_failed">刷新配对码失败</string>
+    <string name="toast_open_settings_failed">无法打开系统设置</string>
+    <string name="toast_bluetooth_permission_required">需要蓝牙权限才能同步通知</string>
+    <string name="toast_bluetooth_required">需要打开蓝牙才能继续</string>
+</resources>
