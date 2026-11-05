@@ -144,12 +144,22 @@ public enum NotifyBridgeIdentity {
     public static let byteCount = 8
 
     public static func parseDeviceID(fromManufacturerData data: Data?) -> String? {
-        guard let data, data.count == byteCount + 2 else { return nil }
-        let first = data[data.startIndex]
-        let second = data[data.startIndex + 1]
-        let company = UInt16(first) | (UInt16(second) << 8)
-        guard company == manufacturerCompanyID else { return nil }
-        return data.dropFirst(2).map { String(format: "%02X", $0) }.joined()
+        guard let data else { return nil }
+        let payload: Data
+        if data.count == byteCount + 2 {
+            let first = data[data.startIndex]
+            let second = data[data.startIndex + 1]
+            let company = UInt16(first) | (UInt16(second) << 8)
+            guard company == manufacturerCompanyID else { return nil }
+            payload = data.dropFirst(2)
+        } else if data.count == byteCount {
+            // Some stacks (and some macOS builds) hand back the manufacturer
+            // payload without the two-byte company identifier.
+            payload = data
+        } else {
+            return nil
+        }
+        return payload.map { String(format: "%02X", $0) }.joined()
     }
 
     public static func manufacturerData(fromDeviceID id: String) -> Data? {

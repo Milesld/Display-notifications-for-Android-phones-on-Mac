@@ -97,6 +97,10 @@ do {
         wrongCompany[0] = 0x00
         check(NotifyBridgeIdentity.parseDeviceID(fromManufacturerData: wrongCompany) == nil, "wrong company rejected")
         check(NotifyBridgeIdentity.parseDeviceID(fromManufacturerData: Data([0xFF])) == nil, "short data rejected")
+        check(
+            NotifyBridgeIdentity.parseDeviceID(fromManufacturerData: data.dropFirst(2)) == deviceID,
+            "identity payload without company ID accepted"
+        )
     } else {
         check(false, "identity manufacturer data")
     }
@@ -151,6 +155,64 @@ do {
     } else {
         check(false, "framed JSON round-trip")
     }
+}
+
+do {
+    let json = #"{"v":2,"type":"notification","seq":7,"data":{"v":1,"type":"notification","id":"x","app":"微信","pkg":"com.tencent.mm","title":"张三","text":"你好"}}"#
+    let message = try JSONDecoder().decode(NetworkMessage.self, from: Data(json.utf8))
+    check(message.isValid, "network message version")
+    check(message.type == "notification", "network notification type")
+    check(message.seq == 7, "network sequence")
+    check(message.data?.text == "你好", "nested notification decodes")
+}
+
+do {
+    let frame = TCPFrameCodec.encode(Data("hello".utf8))
+    check(frame.count == 9, "TCP frame length")
+    var buffer = Data()
+    var frames = TCPFrameCodec.append(frame.prefix(3), to: &buffer)
+    check(frames.isEmpty, "partial TCP frame waits")
+    frames = TCPFrameCodec.append(frame.dropFirst(3), to: &buffer)
+    check(frames.count == 1, "TCP frame completes")
+    check(frames.first.map { String(data: $0, encoding: .utf8) } == "hello", "TCP frame payload")
+
+    let first = TCPFrameCodec.encode(Data("one".utf8))
+    let second = TCPFrameCodec.encode(Data("two".utf8))
+    var combined = Data()
+    let both = TCPFrameCodec.append(first + second, to: &combined)
+    check(both.count == 2, "two buffered TCP frames")
+    check(both.first.map { String(data: $0, encoding: .utf8) } == "one", "first buffered frame")
+    check(both.last.map { String(data: $0, encoding: .utf8) } == "two", "second buffered frame")
+    check(combined.isEmpty, "buffer drained")
+}
+
+do {
+    let secret = RelayCrypto.decodeSecret("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8")
+    check(secret?.count == 32, "relay secret decodes")
+    if let secret {
+        check(RelayCrypto.channel(secret) == "5f288a7a29b15429de3c7a991d40548d", "HKDF channel vector")
+        check(RelayCrypto.token(secret) == "lF8N7GQrFKxTEng0pmO7zA2hKWauQLguOOwH2eZdKKM", "HKDF token vector")
+        check(
+            RelayCrypto.derive(secret, info: "enc", count: 32).base64URLEncodedString()
+                == "d7_iqFy5Lq20DaDM65mP85vOdN1qmT77af5WkTI67Tw",
+            "HKDF encryption vector"
+        )
+        let aad = Data("channel-aad".utf8)
+        let plaintext = "微信消息：今晚一起吃饭吗？🍜"
+        if let encrypted = try? RelayCrypto.encrypt(plaintext, secret: secret, aad: aad) {
+            check((try? RelayCrypto.decrypt(encrypted, secret: secret, aad: aad)) == plaintext, "relay AES-GCM round-trip")
+            check((try? RelayCrypto.decrypt(encrypted, secret: secret, aad: Data("other".utf8))) == nil, "relay AES-GCM rejects wrong AAD")
+        } else {
+            check(false, "relay AES-GCM encrypt")
+        }
+    }
+}
+
+do {
+    check(RelayTarget.parse("example.com", defaultPort: 443) == RelayTarget(host: "example.com", port: 443), "target default port")
+    check(RelayTarget.parse("example.com:8443", defaultPort: 443) == RelayTarget(host: "example.com", port: 8443), "target custom port")
+    check(RelayTarget.parse("[::1]:47821", defaultPort: 443) == RelayTarget(host: "::1", port: 47821), "target IPv6")
+    check(RelayTarget.parse("", defaultPort: 443) == nil, "target empty")
 }
 
 if failures == 0 {

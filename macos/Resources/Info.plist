@@ -17,9 +17,9 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.2.2</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>4</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>LSMinimumSystemVersion</key>
@@ -30,6 +30,12 @@
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>在同一 Wi-Fi 下发现 Android 手机并接收通知。只有在你启用局域网通道时才会访问本地网络。</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_notifybridge._tcp</string>
+    </array>
     <key>NSBluetoothAlwaysUsageDescription</key>
     <string>通过低功耗蓝牙接收 Android 手机的通知并显示在 Mac 上。</string>
     <key>NSBluetoothPeripheralUsageDescription</key>

@@ -4,11 +4,16 @@ import NotifyBridgeCore
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let receiver = BluetoothReceiver()
+    private let directReceiver = DirectNetworkReceiver()
+    private let cloudReceiver = CloudRelayReceiver()
     private let presenter = NotificationPresenter()
 
     private var statusItem: NSStatusItem!
     private var statusMenuItem: NSMenuItem!
     private var deviceMenuItem: NSMenuItem!
+    private var networkStatusMenuItem: NSMenuItem!
+    private var reconnectNetworkMenuItem: NSMenuItem!
+    private var networkSettingsMenuItem: NSMenuItem!
     private var connectMenuItem: NSMenuItem!
     private var pairMenuItem: NSMenuItem!
     private var disconnectMenuItem: NSMenuItem!
@@ -19,6 +24,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var devices: [String] = []
     private var statusText = "正在启动…"
+    private var directStatus = "网络：未启动"
+    private var cloudStatus = "云中转：未配置"
     private var notificationAllowed = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -43,6 +50,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         receiver.onStatusChange = { [weak self] text in
             guard let self else { return }
             self.statusText = text
+            if text.contains("已配对") {
+                self.directReceiver.reloadPairing()
+            }
             self.refreshMenu()
             if text.contains("配对码错误") {
                 NSSound.beep()
@@ -54,19 +64,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.refreshMenu()
         }
         receiver.onMessage = { [weak self] message in
+            self?.handleIncoming(message)
+        }
+        directReceiver.onMessage = { [weak self] message in
+            self?.handleIncoming(message)
+        }
+        cloudReceiver.onMessage = { [weak self] message in
+            self?.handleIncoming(message)
+        }
+        directReceiver.onStatusChange = { [weak self] text in
             guard let self else { return }
-            if message.isNotification {
-                self.presenter.deliver(message)
-            }
+            self.directStatus = text
+            self.refreshMenu()
+        }
+        cloudReceiver.onStatusChange = { [weak self] text in
+            guard let self else { return }
+            self.cloudStatus = text
+            self.refreshMenu()
         }
 
         refreshMenu()
         receiver.start()
+        directReceiver.start()
+        cloudReceiver.start()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         receiver.stop()
+        directReceiver.stop()
+        cloudReceiver.stop()
         AppLogger.info("NotifyBridge terminated")
+    }
+
+    private func handleIncoming(_ message: WireMessage) {
+        guard message.isNotification else { return }
+        presenter.deliver(message)
     }
 
     // MARK: - UI
@@ -96,6 +128,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         deviceMenuItem = NSMenuItem(title: "附近：未发现手机", action: nil, keyEquivalent: "")
         deviceMenuItem.isEnabled = false
         menu.addItem(deviceMenuItem)
+
+        networkStatusMenuItem = NSMenuItem(title: "网络：未启动", action: nil, keyEquivalent: "")
+        networkStatusMenuItem.isEnabled = false
+        menu.addItem(networkStatusMenuItem)
         menu.addItem(.separator())
 
         connectMenuItem = NSMenuItem(
@@ -122,6 +158,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         disconnectMenuItem.target = self
         menu.addItem(disconnectMenuItem)
 
+        let resetItem = NSMenuItem(
+            title: "重置蓝牙连接",
+            action: #selector(resetBluetoothSession),
+            keyEquivalent: ""
+        )
+        resetItem.target = self
+        menu.addItem(resetItem)
+
         autoReconnectMenuItem = NSMenuItem(
             title: "自动重连",
             action: #selector(toggleAutoReconnect),
@@ -137,6 +181,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         forgetMenuItem.target = self
         menu.addItem(forgetMenuItem)
+
+        reconnectNetworkMenuItem = NSMenuItem(
+            title: "重新连接网络通道",
+            action: #selector(reconnectNetworks),
+            keyEquivalent: ""
+        )
+        reconnectNetworkMenuItem.target = self
+        menu.addItem(reconnectNetworkMenuItem)
+
+        networkSettingsMenuItem = NSMenuItem(
+            title: "网络与中继设置…",
+            action: #selector(showNetworkSettings),
+            keyEquivalent: ""
+        )
+        networkSettingsMenuItem.target = self
+        menu.addItem(networkSettingsMenuItem)
         menu.addItem(.separator())
 
         testMenuItem = NSMenuItem(
@@ -178,8 +238,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refreshMenu() {
         guard let statusMenuItem else { return }
 
-        statusMenuItem.title = "状态：\(statusText)"
-        statusItem.button?.toolTip = "通知桥：\(statusText)"
+        let overall = overallStatus()
+        statusMenuItem.title = "状态：\(overall)"
+        statusItem.button?.toolTip = "通知桥：\(overall)"
+        networkStatusMenuItem.title = "\(directStatus) · \(cloudStatus)"
 
         if devices.isEmpty {
             deviceMenuItem.title = "附近：未发现手机"
@@ -203,8 +265,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         autoReconnectMenuItem.title = "自动重连"
         autoReconnectMenuItem.isEnabled = true
         forgetMenuItem.isEnabled = receiver.hasSavedPairing
+        reconnectNetworkMenuItem.isEnabled = NetworkSettings.directEnabled || NetworkSettings.cloudEnabled
 
         permissionMenuItem.title = presenter.permissionSummary
+    }
+
+    private func overallStatus() -> String {
+        var paths: [String] = []
+        if receiver.isPaired { paths.append("蓝牙") }
+        if directReceiver.isPaired { paths.append(directReceiver.pathName) }
+        if cloudReceiver.isPaired { paths.append("云中转") }
+        let notificationsOff = (receiver.isPaired && receiver.phoneNotificationsEnabled == false)
+            || (directReceiver.isPaired && directReceiver.phoneNotificationsEnabled == false)
+        if !paths.isEmpty {
+            let suffix = notificationsOff ? "（手机通知监听未就绪）" : ""
+            return "已连接：\(paths.joined(separator: " + "))\(suffix)"
+        }
+        if receiver.isConnected || directReceiver.isConnected || cloudReceiver.isConnected {
+            return "已连接，等待配对"
+        }
+        return statusText
     }
 
     // MARK: - Actions
@@ -237,6 +317,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         receiver.disconnect()
     }
 
+    @objc private func resetBluetoothSession() {
+        receiver.resetBluetoothSession()
+        refreshMenu()
+    }
+
     @objc private func toggleAutoReconnect() {
         receiver.autoReconnectEnabled.toggle()
         refreshMenu()
@@ -252,8 +337,101 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         if alert.runModal() == .alertFirstButtonReturn {
             receiver.forgetPairing()
+            directReceiver.forgetPairing()
             refreshMenu()
         }
+    }
+
+    @objc private func reconnectNetworks() {
+        directReceiver.reconnectNow()
+        cloudReceiver.reconnectNow()
+        refreshMenu()
+    }
+
+    @objc private func showNetworkSettings() {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "网络与中继设置"
+        alert.informativeText = "蓝牙始终保留。网络通道用于手机不在蓝牙范围时继续收通知；多条通道会同时尝试，先到的那条送达。"
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+
+        let width: CGFloat = 430
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 330))
+        let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: width, height: 330))
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 7
+        stack.translatesAutoresizingMaskIntoConstraints = true
+
+        let directCheck = NSButton(checkboxWithTitle: "启用局域网 / 远程直连（TCP 47821）", target: nil, action: nil)
+        directCheck.state = NetworkSettings.directEnabled ? .on : .off
+
+        let directLabel = NSTextField(labelWithString: "远程直连地址（Tailscale IP 或 MagicDNS，留空则只用局域网）")
+        directLabel.font = .systemFont(ofSize: 11)
+        directLabel.textColor = .secondaryLabelColor
+        let directField = NSTextField(string: NetworkSettings.directHost)
+        directField.placeholderString = "例如 100.64.0.2:47821 或 pixel.tailnet-xxxx.ts.net:47821"
+        directField.widthAnchor.constraint(equalToConstant: width - 8).isActive = true
+
+        let cloudCheck = NSButton(checkboxWithTitle: "启用云中转（需要自建中继服务器）", target: nil, action: nil)
+        cloudCheck.state = NetworkSettings.cloudEnabled ? .on : .off
+
+        let cloudLabel = NSTextField(labelWithString: "中继地址（host:port，TLS）")
+        cloudLabel.font = .systemFont(ofSize: 11)
+        cloudLabel.textColor = .secondaryLabelColor
+        let cloudField = NSTextField(string: NetworkSettings.relayTarget)
+        cloudField.placeholderString = "relay.example.com:443"
+        cloudField.widthAnchor.constraint(equalToConstant: width - 8).isActive = true
+
+        let secretLabel = NSTextField(labelWithString: "中继密钥（在手机「网络与中继设置」中生成后粘贴）")
+        secretLabel.font = .systemFont(ofSize: 11)
+        secretLabel.textColor = .secondaryLabelColor
+        let secretField = NSTextField(string: NetworkSettings.relaySecret)
+        secretField.placeholderString = "43 位 Base64URL 密钥"
+        secretField.widthAnchor.constraint(equalToConstant: width - 8).isActive = true
+
+        let hint = NSTextField(wrappingLabelWithString: "中继只转发端到端加密后的内容，看不到通知正文。Tailscale 方式不需要中继服务器，只需在手机和 Mac 上登录同一个 tailnet，然后把手机的 Tailscale 地址填到上面。查看手机地址：Tailscale 管理后台 → Machines → 手机详情，复制 100.x IP 或 MagicDNS 名称；Mac 终端也可以跑 tailscale status。")
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+        hint.widthAnchor.constraint(equalToConstant: width - 8).isActive = true
+
+        [directCheck, directLabel, directField, cloudCheck, cloudLabel, cloudField, secretLabel, secretField, hint].forEach {
+            stack.addArrangedSubview($0)
+        }
+        container.addSubview(stack)
+        stack.frame = container.bounds
+        alert.accessoryView = container
+
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let targetText = cloudField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let secretText = secretField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if cloudCheck.state == .on {
+            guard RelayTarget.parse(targetText, defaultPort: NetworkProtocol.defaultRelayPort) != nil else {
+                showAlert(title: "中继地址无效", message: "请填写 host:port，例如 relay.example.com:443。")
+                return
+            }
+            guard RelayCrypto.decodeSecret(secretText) != nil else {
+                showAlert(title: "中继密钥无效", message: "请粘贴手机上显示的 43 位密钥。")
+                return
+            }
+        }
+        let directText = directField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !directText.isEmpty, RelayTarget.parse(directText, defaultPort: NetworkProtocol.defaultDirectPort) == nil {
+            showAlert(title: "远程直连地址无效", message: "请填写 host:port，例如 100.64.0.2:47821。")
+            return
+        }
+
+        NetworkSettings.directEnabled = directCheck.state == .on
+        NetworkSettings.directHost = directText
+        NetworkSettings.cloudEnabled = cloudCheck.state == .on
+        NetworkSettings.relayTarget = targetText
+        NetworkSettings.relaySecret = secretText
+        directReceiver.reload()
+        cloudReceiver.reload()
+        refreshMenu()
     }
 
     @objc private func sendTestNotification() {
@@ -294,18 +472,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showHelp() {
         let message = """
-        通知桥把 Android 手机的新通知通过低功耗蓝牙转发到这台 Mac。
+        通知桥把 Android 手机的新通知转发到这台 Mac。默认走低功耗蓝牙；手机不在身边时，可以自动改用局域网、Tailscale 直连或自建云中转。
 
         使用方法：
         1. 在 Android 手机上打开「通知桥」，授权通知访问。
         2. 启动同步服务，记下手机上的 6 位配对码。
         3. 在 Mac 菜单栏点击通知桥图标，选择「连接手机」，输入配对码。
 
-        自动重连：
+        自动重连与多通道：
         • 首次配对成功后，Mac 会把配对码保存在本机应用设置中，并记住这台手机。
-        • 手机离开范围再回来、Mac 重启后，只要菜单中的「自动重连」是开启的，就会自动连接并恢复通知。
-        • 手动点「断开连接」会暂停本次会话的自动重连；再点「连接手机」即可恢复。
-        • 「忘记已配对手机」会删除保存的配对信息。
+        • 蓝牙、局域网、远程直连和云中转会同时尝试；哪条通就用哪条，重复通知会去重。
+        • 手机离开蓝牙范围后，局域网/Tailscale/云中转会继续送达。
+        • 「网络与中继设置」里可以填写 Tailscale 地址，或配置自建中继。
+        • 手机 tailnet 地址在 Tailscale 管理后台 → Machines → 手机详情里查看；Mac 终端也可用 tailscale status。填地址时要加 :47821。
+        • 手动点「断开连接」只暂停蓝牙；网络通道仍会保持。
+        • 「忘记已配对手机」会删除保存的配对信息，网络直连也会停止。
 
         通知只有通知中心、没有横幅？
         • 先确认系统设置 → 通知 → 通知桥 的样式是「横幅」或「提醒」。
@@ -314,7 +495,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         说明：
         • 仅支持 Android。iPhone 没有向第三方 App 开放读取系统通知的接口。
-        • 所有内容只在手机与 Mac 之间传输，不经过互联网。
+        • 默认情况下内容只在手机与 Mac 之间传输。启用云中转后，中继只转发端到端加密后的密文，看不到通知正文。
+        • 局域网和 Tailscale 直连使用同一套 TCP 协议；Tailscale 本身已加密，局域网内是明文（与蓝牙一致）。
         """
         showAlert(title: "通知桥", message: message)
     }

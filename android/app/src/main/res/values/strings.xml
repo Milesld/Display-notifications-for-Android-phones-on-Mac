@@ -2,30 +2,36 @@
 <resources>
     <string name="app_name">通知桥</string>
     <string name="app_subtitle">把 Android 手机的通知，悄悄带到 Mac。</string>
-    <string name="app_pill">蓝牙直连 · 本地传输</string>
+    <string name="app_pill">蓝牙 · 局域网 · 远程 · 云中转</string>
 
     <string name="step_one_title">允许读取通知</string>
     <string name="notification_access_granted">已授权，通知桥可以读取新通知</string>
+    <string name="notification_access_no_listener">已授权，但通知监听服务未连接，点下方按钮重试</string>
+    <string name="rebind_listener">重新连接通知监听</string>
+    <string name="listener_rebind_requested">已请求重新连接通知监听</string>
+    <string name="listener_repair_hint">如仍显示未连接，请在本页把「通知桥」的通知访问关掉再打开</string>
     <string name="notification_access_missing">尚未授权通知访问</string>
     <string name="notification_hint">Android 只允许获得「通知访问」权限的应用读取通知。通知内容不会上传到服务器。</string>
     <string name="manage_access">管理通知访问</string>
     <string name="grant_access">去授权</string>
 
-    <string name="step_two_title">启动蓝牙同步</string>
+    <string name="step_two_title">启动同步服务</string>
     <string name="service_running">同步服务运行中</string>
     <string name="service_stopped">同步服务未启动</string>
-    <string name="connection_status_title">连接状态</string>
-    <string name="connection_not_running">启动同步后，这里会显示 Mac 连接状态</string>
-    <string name="connection_paired">Mac 已连接并配对，通知会实时同步</string>
-    <string name="connection_waiting_for_pin">Mac 已连接，等待输入配对码</string>
+    <string name="connection_status_title">同步状态</string>
+    <string name="connection_not_running">启动同步后，这里会显示 Mac 是否已连接</string>
+    <string name="connection_paired">已连接并配对（蓝牙），通知会实时同步</string>
+    <string name="connection_paired_both">已连接并配对（蓝牙 + 网络），通知会实时同步</string>
+    <string name="connection_waiting_for_pin">蓝牙已连接，等待输入配对码</string>
     <string name="connection_waiting_for_mac">等待 Mac 连接</string>
-    <string name="bluetooth_title">蓝牙</string>
+    <string name="connection_network_paired">已连接并配对（网络），通知会实时同步</string>
+    <string name="bluetooth_title">蓝牙通道</string>
     <string name="bluetooth_state_format">%1$s</string>
     <string name="start_sync">启动同步</string>
     <string name="stop_sync">停止同步</string>
     <string name="refresh_pin">刷新配对码</string>
     <string name="send_test_message">发送测试消息到 Mac</string>
-    <string name="toast_pair_first">请先在 Mac 上完成配对</string>
+    <string name="toast_pair_first">请先在 Mac 上完成蓝牙或网络配对</string>
     <string name="toast_test_sent">测试消息已发送</string>
 
     <string name="pairing_label">Mac 连接配对码</string>
@@ -34,13 +40,13 @@
     <string name="mac_hint_stopped">点击上方「启动同步」，再回到 Mac 完成连接。</string>
 
     <string name="privacy_title">隐私</string>
-    <string name="privacy_body">通知内容只在手机与 Mac 的蓝牙连接中传输，不经过互联网，也不会写入服务器。配对码仅在当前连接中有效。</string>
+    <string name="privacy_body">默认只在手机与 Mac 之间传输。可选的局域网 / Tailscale 直连不经过第三方服务器；云中转使用端到端加密，中继只看到密文、通道 ID 和消息 ID，看不到通知正文。蓝牙链路仍与以前一样是近场明文。</string>
     <string name="limitations_title">限制</string>
     <string name="limitations_body">iPhone 不适用：iOS 不允许第三方 App 读取系统通知。微信、短信等能否显示具体内容，取决于手机通知本身是否展示详情；部分系统会隐藏锁屏通知内容。</string>
-    <string name="version_footer">NotifyBridge 0.1 · Android 8.0+ · 需要一个蓝牙适配器正常的 Mac</string>
+    <string name="version_footer">NotifyBridge 0.2.5 · Android 8.0+ · 蓝牙 / 局域网 / 远程直连 / 云中转</string>
 
     <string name="relay_channel_name">通知同步</string>
-    <string name="relay_channel_description">保持与 Mac 的低功耗蓝牙连接</string>
+    <string name="relay_channel_description">保持与 Mac 的蓝牙和网络连接</string>
 
     <string name="toast_enable_notification_access">请先开启通知访问权限</string>
     <string name="toast_open_bluetooth_failed">无法打开蓝牙开关</string>
@@ -51,4 +57,28 @@
     <string name="toast_open_settings_failed">无法打开系统设置</string>
     <string name="toast_bluetooth_permission_required">需要蓝牙权限才能同步通知</string>
     <string name="toast_bluetooth_required">需要打开蓝牙才能继续</string>
+
+    <!-- Network channels -->
+    <string name="network_title">网络通道</string>
+    <string name="network_lan_label">局域网 / Tailscale</string>
+    <string name="network_cloud_label">云中转</string>
+    <string name="network_settings">网络与中继设置…</string>
+    <string name="network_hint">手机不在蓝牙范围时，Mac 会自动尝试局域网、Tailscale 直连或云中转。多条通道同时可用时，先到的通知会送达，重复的会自动去重。</string>
+    <string name="network_dialog_title">网络与中继</string>
+    <string name="network_dialog_hint">Tailscale 方式不需要中继服务器：在手机和 Mac 上登录同一个 tailnet，然后在 Mac 设置里填写手机的 Tailscale 地址。云中转需要一台可访问的 TLS 中继服务器。</string>
+    <string name="relay_target_label">中继地址（host:port，TLS）</string>
+    <string name="relay_target_hint">relay.example.com:443</string>
+    <string name="relay_secret_label">中继密钥（Mac 端需要粘贴同一个）</string>
+    <string name="relay_secret_hint">点「生成新密钥」创建 43 位密钥</string>
+    <string name="relay_enable">启用云中转</string>
+    <string name="relay_generate">生成新密钥</string>
+    <string name="relay_copy">复制密钥</string>
+    <string name="relay_saved">网络设置已保存</string>
+    <string name="relay_invalid_target">中继地址格式不对，请填写 host:port</string>
+    <string name="relay_invalid_secret">中继密钥无效，请重新生成</string>
+    <string name="relay_copied">密钥已复制</string>
+    <string name="network_lan_status">%1$s</string>
+    <string name="network_cloud_status">%1$s</string>
+    <string name="network_card_hint">蓝牙不可达时自动切换；局域网与 Tailscale 使用同一端口 47821。</string>
+    <string name="network_lan_note">局域网无需配置：启动同步后自动监听 47821 并广播，Mac 会自动发现。</string>
 </resources>

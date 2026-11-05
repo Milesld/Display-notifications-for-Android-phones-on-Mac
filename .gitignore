@@ -18,3 +18,8 @@ android/captures/
 *.swo
 
 android/.kotlin/
+
+# Relay server
+server/certs/
+server/data/
+server/node_modules/

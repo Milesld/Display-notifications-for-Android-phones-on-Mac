@@ -2,9 +2,9 @@
 
 <img src="assets/AppIcon-1024.png" width="96" align="right" alt="通知桥 App 图标" />
 
-把 Android 手机收到的新通知（短信、微信、其他 App）通过**低功耗蓝牙**转发到 Mac，并在 macOS 通知中心显示标题和正文。
+把 Android 手机收到的新通知（短信、微信、其他 App）转发到 Mac，并在 macOS 通知中心显示标题和正文。默认走**低功耗蓝牙**；手机不在身边时，可以自动改用**局域网 / Tailscale 直连**，或可选的**自建云中转**。
 
-这是一个可运行的原型：Android 手机作为 BLE 外设广播通知，Mac 作为 BLE 中心设备接收。首次配对后，手机离开范围再回来、Mac 重启，都会自动重连。**不经过互联网，不需要同一 Wi-Fi。**
+这是一个可运行的原型：首次配对后，蓝牙断线会回到原来的自动重连；同时新增的网络通道会独立保持连接，哪条通道先到就用哪条，重复通知自动去重。默认流量不经过第三方服务器；启用云中转时，内容在手机端加密，服务器只转发密文。
 
 ---
 
@@ -30,10 +30,39 @@
 
 ---
 
+## 手机不在身边，也能收到吗？
+
+可以，但要满足一个前提：**手机仍然开机、有电、联网**。通知桥不是把手机“变成不用开机”，而是让手机留在家里当转发端，你在 Mac 上收通知。
+
+| 场景 | 走哪条通道 | 需要配置 |
+| --- | --- | --- |
+| 手机在 Mac 旁边 | 蓝牙（自动） | 首次 6 位配对码 |
+| 手机在家，Mac 在同一 Wi-Fi | 局域网（自动发现） | 手机端启动同步即可 |
+| 手机在家，Mac 在公司/外地 | Tailscale 直连 | 两端装 Tailscale，Mac 填手机 tailnet 地址 |
+| 没有 tailnet，或需要离线排队 | 云中转 | 一台 TLS 中继服务器 + 两端同一密钥 |
+
+三条网络通道与蓝牙可以同时运行。Mac 菜单栏会显示当前可用路径；某条断了会自动退避重连。更完整的协议、部署和安全边界见 [docs/network.md](docs/network.md)。
+
+### 能不能不装 Tailscale？
+
+可以。用**云中转**：手机和 Mac 各只装「通知桥」，不再装 Tailscale；代价是需要一台公网可达的服务器（VPS / 云主机 / 有公网地址的 NAS）。服务器只跑一个容器，手机和 Mac 都主动外连它，不需要在服务器上装客户端 App。
+
+| 方案 | 手机 App | Mac App | 额外设备 | 适合 |
+| --- | --- | --- | --- | --- |
+| 蓝牙 / 局域网 | 通知桥 | 通知桥 | 无 | 在家，近距离 |
+| Tailscale | 通知桥 + Tailscale | 通知桥 + Tailscale | 无（用 Tailscale 协调服务） | 异地，不想维护服务器 |
+| 云中转 | 通知桥 | 通知桥 | 1 台公网服务器 | 异地，想少装 App |
+| 公共中继（如 ntfy.sh） | 通知桥 | 通知桥 | 第三方服务 | 轻量试用；依赖第三方，国内可达性不一定 |
+
+**完全“不装额外 App、也不准备任何服务器”是做不到的**：手机在蜂窝网络下位于运营商 NAT 后，没有公网入口，Mac 无法凭空找到它。必须有一个公网 rendezvous/relay（云中转），或者一个 VPN overlay（Tailscale）。把 Tailscale 客户端嵌进 App 在技术上可行（macOS 可用 userspace `tsnet`，Android 需要 `libtailscale`/gomobile 和 VpnService），但工程量大、包体大，而且仍然需要 Tailscale 账号和协调服务；对这个原型不划算。云中转客户端已经内置在 0.2.x 里，是最省 App 的现实路径。
+
+---
+
 ## 它长什么样
 
-- **Android 端**：打开通知访问 → 启动同步 → 显示 6 位配对码；前台服务保持 BLE 广播，断线后自动恢复广播。
-- **Mac 端**：菜单栏图标 → 首次输入配对码；之后新通知以 macOS 横幅显示，断线后自动重连。
+- **Android 端**：打开通知访问 → 启动同步 → 显示 6 位配对码；前台服务同时保持 BLE 广播、TCP 服务（47821）和可选的云中转连接。
+- **Mac 端**：菜单栏图标 → 首次输入配对码；之后新通知以 macOS 横幅显示。蓝牙、局域网、Tailscale 与云中转会同时尝试，断线后自动重连。
+- **网络设置**：手机和 Mac 都有「网络与中继设置…」，用于配置 Tailscale 地址、云中转地址与端到端密钥。
 - 不显示 Dock 图标（`LSUIElement`），只占菜单栏。
 - 通知内容格式：标题为发件人/会话，副标题为 App 名称，正文为消息内容。
 
@@ -67,13 +96,14 @@
 │                    │ JSON                                       │
 │                    ▼                                            │
 │  FrameCodec：4 字节头 + 16 字节内容，拆成 20 字节 BLE 通知帧       │
+│  TCP 47821 / 云中转客户端（与 BLE 并列）                          │
 │                    │                                            │
 │  BluetoothGattServer（外设）                                     │
 │    ├─ TX characteristic：Notify → Mac                            │
 │    ├─ RX characteristic：Write ← Mac（配对码 / 心跳）             │
 │    └─ 扫描响应：Manufacturer Data = 8 字节稳定设备 ID             │
 └────────────────────────────┬────────────────────────────────────┘
-                             │ BLE（无互联网）
+                             │ BLE（近场）
 ┌────────────────────────────▼────────────────────────────────────┐
 │  macOS 菜单栏 App（CBCentralManager）                             │
 │    ├─ 扫描服务 UUID + 设备 ID → 自动连接                          │
@@ -85,17 +115,29 @@
 
 BLE 服务与 TX/RX 的 UUID、帧格式、JSON 字段和配对流程见 [docs/protocol.md](docs/protocol.md)。
 
+网络通道与 BLE 并列，不替代它：
+
+```text
+NotificationHub
+  ├─ BLE GATT（近场，自动）
+  ├─ TCP 47821：局域网 Bonjour / Tailscale 手动地址（同一协议）
+  └─ 云中转：TLS + AES-GCM，服务器只转发密文
+```
+
+手机端把同一条通知分发给所有已启用通道；Mac 端按「通知 ID + 手机发送时间」去重，所以多通道同时在线不会重复弹窗。网络协议、断线补发、云中转加密和部署见 [docs/network.md](docs/network.md)。
+
 ---
 
 ## 快速开始
 
 ### 0. 直接用已经打好的包
 
-本仓库的 `dist/` 目录包含：
+构建产物通过 GitHub Releases 发布，二进制不进 Git（`dist/` 只保留 `SHA256SUMS.txt`）：
 
-- `NotifyBridge-macOS-0.1.0.dmg`：Mac 安装包（Apple Silicon）。
-- `NotifyBridge-macOS-0.1.0.zip`：同样的 `.app` 压缩包。
-- `NotifyBridge-Android-0.1.0-debug.apk`：可直接安装的 Android debug 包。
+- 最新发布：<https://github.com/Milesld/Display-notifications-for-Android-phones-on-Mac/releases/latest>
+- `NotifyBridge-macOS-0.2.2.dmg`：Mac 安装包（Apple Silicon；本次发布 Mac 端代码未改动）。
+- `NotifyBridge-macOS-0.2.2.zip`：同样的 `.app` 压缩包。
+- `NotifyBridge-Android-0.2.5-debug.apk`：可直接安装的 Android debug 包。
 - `SHA256SUMS.txt`：三个产物的校验和。
 
 Mac 端没有经过 Apple 公证（ad-hoc 签名），首次打开如果被 Gatekeeper 拦住，右键 App →「打开」。Android 包使用 debug 签名，适合自用测试，不适合上架。
@@ -109,10 +151,11 @@ Mac 端没有经过 Apple 公证（ad-hoc 签名），首次打开如果被 Gate
 open dist/NotifyBridge.app
 ```
 
-首次启动会请求两个权限：
+首次启动会请求两个权限，首次使用局域网发现时还会请求第三个：
 
 1. **蓝牙**：用于扫描和连接手机。
 2. **通知**：用于在 Mac 上显示同步过来的消息。
+3. **本地网络**（macOS 15+）：用于通过 Bonjour 发现同一 Wi-Fi 下的手机；拒绝后仍可使用 Tailscale/云中转。
 
 如果通知权限被拒绝，菜单栏「通知权限：未开启」可以打开系统设置。也可以先点「发送测试通知」验证 Mac 端显示链路。
 
@@ -140,7 +183,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 > 项目包含标准的 Gradle Wrapper 8.9（`gradlew` + `gradle/wrapper/gradle-wrapper.jar`）。首次运行会下载官方 Gradle 8.9；也可以直接用 Android Studio 打开 `android/`。
 
-本项目的开发环境已经完成 APK 构建、aapt 清单检查、单元测试，并在实体 Android 手机上验证过 BLE 配对与通知转发。自动重连需要同时安装本次更新后的 Android APK 和 Mac App（见“验证状态”）。
+本项目的开发环境已经完成 APK 构建、aapt 清单检查、单元测试，并在实体 Android 手机上验证过 BLE 配对与通知转发。自动重连与网络通道需要同时安装本次更新后的 Android APK 和 Mac App（见“验证状态”）；只更新一端时 BLE 仍可用，但不会出现新的网络设置。
 
 ### 3. 在手机上设置
 
@@ -167,6 +210,26 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 Mac 端也可以通过「发送测试通知」只测试本机通知权限，不需要手机。
 
+### 5. 可选：让手机不在身边也能收
+
+**先完成一次蓝牙配对**，Mac 会保存 6 位配对码；局域网和 Tailscale 直连会复用它。之后：
+
+- **局域网（同 Wi-Fi）**：手机端保持「启动同步」，Mac 会自动通过 Bonjour 发现手机，不需要额外配置。
+- **Tailscale（异地）**：
+  1. 手机和 Mac 都安装 Tailscale，登录同一个 tailnet。
+  2. 在手机上允许 Tailscale 的 always-on VPN，并把「通知桥」加入电池优化白名单。
+  3. 查手机的 tailnet 地址：浏览器打开 <https://login.tailscale.com/admin/machines>，找到手机 → 详情里有 **Tailscale IP（100.x.y.z）** 和 **MagicDNS name**（如 `pixel-8.tailnet-abc123.ts.net`），复制一个。手机上 Tailscale App 的设备详情页也能看到 100.x 地址；Mac 终端可用 `tailscale status`。
+  4. 在 Mac 菜单栏 →「网络与中继设置…」勾选「启用局域网 / 远程直连」，填写 `手机地址:47821`，例如 `pixel-8.tailnet-abc123.ts.net:47821` 或 `100.101.102.103:47821`。
+  5. 在 Mac 终端用 `tailscale ping 手机设备名` 和 `nc -vz 手机地址 47821` 验证（详见 [docs/network.md](docs/network.md)）。
+- **云中转（没有 tailnet，或要离线排队）**：
+  1. 按 [server/README.md](server/README.md) 在一台可访问的服务器上启动中继（TLS）。
+  2. 手机「网络与中继设置…」→ 生成密钥 → 填中继地址 `relay.example.com:443` → 勾选启用。
+  3. Mac「网络与中继设置…」→ 填同一个地址 → 粘贴同一密钥 → 勾选启用。
+
+Mac 菜单里的「状态」会显示当前可用路径，例如「已连接：蓝牙 + 局域网 + 云中转」。如果手机离开蓝牙范围，网络通道会继续送达；重复通知按 ID + 发送时间去重。详细协议与安全说明见 [docs/network.md](docs/network.md)。
+
+> 手机仍然必须开机、有电、联网。Android 厂商可能杀前台服务，建议把通知桥设为「不受限制/允许后台运行」，关闭电池优化。
+
 ---
 
 ## 验证状态
@@ -174,23 +237,41 @@ Mac 端也可以通过「发送测试通知」只测试本机通知权限，不�
 已经在本机验证：
 
 - `swift build` 编译 macOS 端成功。
-- `swift run ProtocolSelfTest`：帧拆分/重组、UTF-8、序号错误、JSON 编解码全部通过。
+- `swift run ProtocolSelfTest`：原有 BLE 帧/JSON 测试全部通过；新增 TCP 分帧、HKDF 跨语言向量、AES-GCM、嵌套通知 JSON、地址解析测试也全部通过（共 58 项）。
 - macOS `.app` 打包、ad-hoc 签名和 `codesign --verify` 通过。
 - App 可启动，菜单栏进程正常，CoreBluetooth 进入 poweredOn 并开始扫描。
-- Android 工程在本机用 JDK 17 + Android SDK 35 + Gradle 8.9 构建成功；`FrameCodecTest` 6/6、`NotificationMergeTest` 4/4 通过。
-- 已用 aapt2 检查 APK：包名、minSdk 26、targetSdk 35、通知监听组件、BLE 权限均存在；**没有申请 INTERNET 权限**。
-- 在 Android 15 模拟器（API 35）上安装并启动成功：通知访问授权生效、通知监听服务收到系统通知、前台服务运行（`foregroundServiceType=connectedDevice`），BLE 广播成功，UI 显示「等待 Mac 连接」。
+- Android 工程在本机用 JDK 17 + Android SDK 35 + Gradle 8.9 构建成功；`FrameCodecTest` 6/6、`NotificationMergeTest` 4/4、`TcpFrameTest` 3/3、`NetCryptoTest` 4/4 通过。
+- APK 清单包含通知监听组件、BLE 权限，以及新网络通道需要的 `INTERNET` / `ACCESS_NETWORK_STATE` / `CHANGE_WIFI_MULTICAST_STATE` / `WAKE_LOCK`。
+- **直连 TCP 端到端（Mac 侧）**：用模拟手机在 `127.0.0.1:47821` 完成 hello/auth/auth_ok、推送通知、Mac 弹窗并回 ACK。
+- **直连 TCP 端到端（Android 侧）**：Android 15 模拟器 + `adb forward` + 本机 Node 客户端 / Mac App，完成 auth、测试通知、Mac 弹窗、ACK；Android 服务同时成功注册 Bonjour（mDNS），并验证了 `WAKE_LOCK`/Wi-Fi 锁和后台广播不会阻塞。
+- **云中转端到端**：启动真实 TLS 中继，模拟手机用同一密钥做 HKDF + AES-GCM，Mac 解密后弹窗并 ACK；服务器的队列、离线补发和重启持久化由 `server/test/relay-test.js` 验证通过。
+- 跨语言加密向量一致：Android、Swift、Node 三端的 HKDF channel/token/encKey 和 AES-GCM 往返测试使用同一组固定向量。
+- Android 15 模拟器（API 35）安装/启动、通知访问授权、前台服务、BLE 广播仍正常；新版还额外验证了 TCP 监听、Bonjour 注册和 adb 端口转发下的完整收发。
 - 使用实体 Android 手机与 Mac 完成了真实的 BLE 配对和通知转发：短信、微信通知均成功到达 Mac。
-- 自动重连：预置配对信息后重启 Mac App，App 在扫描到手机后**无需点击**自动连接并自动发送配对码；故意使用错误配对码时，手机会返回配对失败，Mac 会清除失效的配对信息，符合预期。
+- 自动重连：预置配对信息后重启 Mac App，App 在扫描到手机后**无需点击**自动连接并自动发送配对码；故意使用错误配对码时，手机会返回配对失败，Mac 保留保存的配对信息并提示手动输入新码（0.2.2 起不再清除，也不再停用自动重连）。
 - 重复通知修复：Android 改用稳定 notification key 作为 ID、按消息时间选择最新短信、跳过没有更新消息时间的通知更新；Mac 兼容旧 ID 并增加 2 秒相同内容去重。相关 ID 归一化测试已通过，APK/Mac App 均已重新构建。
 - 首次连接失败修复：日志确认首次连接报 `Device is invalid`（手机轮换 BLE 地址后缓存对象失效），第二次才成功。新版会选择最近扫描对象、按稳定 ID 替换旧对象，并在连接失败时保留配对码自动重扫重试一次。
 - 次日重连风暴修复：日志显示旧版在 Mac 睡眠/蓝牙反复开关期间持续连接弱信号手机，最终报 `maximum number of connections for this client`。新版增加指数退避、连接数上限 2/5 分钟冷却、弱信号（< -88 dBm）不自动连接、以及退避期间停止扫描。
 - 连接后无通知诊断：Mac 端配对成功后会显示手机通知访问是否开启；手机端新增「发送测试消息到 Mac」按钮，可区分“BLE 通道问题”与“手机通知监听/授权问题”。Android 发送通知帧新增 8 秒 watchdog，避免发送队列卡死后永久无通知。
+- 通知监听掉线诊断（0.2.1）：Mac 菜单会在手机通知监听未就绪时显示「手机通知监听未就绪」；Android 端会区分「已授权但监听服务未连接」，并提供「重新连接通知监听」按钮，前台服务每 60 秒检查并请求重绑。
+- 隔夜/周末重连修复（0.2.2）：日志确认这台 Mac 空闲时每 45 秒进入一次维护性睡眠，每次睡眠都会把蓝牙控制器断电，旧版把每次断电都当成“用户关了蓝牙”并从头扫描；同时连接请求没有超时，一次挂起就会让 App 停在“正在连接”、不再扫描、菜单项变灰，配对码自然输不进去。新版：
+  - Mac 监听系统睡眠/唤醒，醒来清掉挂起的连接、退避和冷却后重新扫描；睡眠期间的蓝牙断电不再当成错误。
+  - 连接、服务发现、配对协商各加 12–15 秒看门狗；超时主动断开并按退避重试，不会再无限挂起。
+  - 手机返回配对失败时保留保存的配对码、不再停用自动重连；链路保持连接，菜单里的「输入配对码…」可以直接输新码。
+  - 心跳期间禁止 App Nap，避免 8 秒心跳被系统节流后触发手机端 30 秒超时。
+  - 菜单新增「重置蓝牙连接」，卡住时一键丢弃挂起请求并重新扫描。
+  - Android 端增加广播看门狗（广播丢失/失败会自动重启）、半开连接 15 秒回收、拒绝第二个 central，并对非当前设备的写入返回失败而不是静默丢弃。
+- Android 首页布局（0.2.3）：把 6 位配对码卡片移到网络通道卡片之前；启动同步、刷新配对码，或在未配对时重新打开 App，页面会自动滚到配对码，不用再手动下拉。Mac 端仍为 0.2.2，两端协议不变，可混装。
+- Android 文案（0.2.4）：第二步「启动蓝牙同步」改为「启动同步服务」；卡片内「连接状态 / 蓝牙」改为「同步状态 / 蓝牙通道」，同步状态会标明当前走蓝牙、网络，还是两者都有；前台通知也按通道显示。
+- 通知监听修复（0.2.5）：已授权但监听服务未连接时，点「重新连接通知监听」会请求重绑并直接打开系统通知访问页，不再只弹一句 toast；监听被系统重绑（onRebind）时也会把状态更新为已连接，不会卡在「监听服务未连接」。
 - 通知权限诊断：macOS 系统日志显示通知已按 banner 投递（`Presenting ... as banner`），但被当前启用的专注模式以 `DND suppression: delay` 暂缓，因此只进入通知中心。系统设置中的通知桥样式为「横幅」。
 - 已生成 macOS DMG/ZIP 和 Android APK，校验和见 `dist/SHA256SUMS.txt`。
 
 尚未验证：
 
+- **新版 Android APK 的局域网 / Tailscale / 云中转还没有在实体手机上跑过**；目前完成了 Android 15 模拟器 + `adb forward` 的 TCP 闭环，以及 Mac 端对模拟手机/模拟中继的端到端验证。真实 Wi-Fi、mDNS 跨设备发现、Tailscale ACL、4G/5G 切换仍需真机验证。
+- Android 云中转客户端只完成了编译和单元测试；Mac 云中转客户端已与真实 TLS 中继完成端到端验证。
+- 实体手机上“蓝牙 + 局域网 + 云中转”同时在线时的去重和切换；Mac 端去重逻辑已经实现，但需要真机闭环。
 - 新版心跳/30 秒断线检测在实体手机上的完整表现（旧 APK 没有心跳，需要安装新版 APK 后验证手机端自动显示断开）。
 - “首次配对码自动重试”和“连接后无通知”的实机闭环：代码已编译、安装在模拟器验证；实体手机上的最终表现需要你在安装新 APK 后测试。
 - 成功自动重连后的稳定 ID 匹配：本次自动连接测试使用的是旧 APK（无 Manufacturer Data），通过“首次迁移”路径自动连接；稳定 ID 广播已实现并可在 Android 模拟器启动，但还没有在实体手机上完成一次“新版手机 + 新版 Mac”的自动重连闭环。
@@ -198,7 +279,8 @@ Mac 端也可以通过「发送测试通知」只测试本机通知权限，不�
 - iPhone（不支持，见上）。
 - Mac 构建为 Apple Silicon（arm64）版本，未生成 Intel 通用二进制。
 
-> APK 路径：`dist/NotifyBridge-Android-0.1.0-debug.apk`  
+> APK 路径：`dist/NotifyBridge-Android-0.2.5-debug.apk`
+>
 > Android 单元测试：`android/app/src/test/java/com/notifybridge/app/FrameCodecTest.kt`、`NotificationMergeTest.kt`
 
 ---
@@ -268,6 +350,12 @@ Mac 在夜间多次睡眠/唤醒、蓝牙反复关闭再打开，旧版自动重
 
 如果升级后仍看到这个错误，先关闭再打开 Mac 蓝牙（或重启 Mac），然后重新打开通知桥；这是清理已经被旧版耗尽的连接槽最直接的方法。
 
+0.2.2 之后如果第二天仍然连不上，先看日志（`~/Library/Logs/NotifyBridge.log`）：
+
+- 每 45 秒一对 `Bluetooth is powered off` / `Bluetooth is powered on`，说明 Mac 还在维护性睡眠循环里（`pmset -g log` 对应 `Maintenance Sleep: TCPKeepAlive=active`）。这是系统电源行为，不是配对问题：可以夜间接电源，或执行 `sudo pmset -b powernap 0`、`sudo pmset -b tcpkeepalive 0` 减少唤醒。
+- 出现 `System woke; rebuilding the BLE session` 说明唤醒处理已生效；出现 `BLE session timed out` 说明看门狗在回收挂起的连接，连续出现时优先检查手机端前台服务是否被厂商冻结。
+- 状态停在「正在连接…」时，点菜单里的「重置蓝牙连接」即可恢复，不需要退出 App。
+
 ### 为什么键盘、鼠标、触控板能秒连，手机不行？
 
 它们和这个 App 走的是完全不同的路径：
@@ -289,10 +377,11 @@ iOS 没有“通知监听”公开 API，第三方 App 只能处理自己的通�
 
 ### 连接安全吗？
 
-- 内容只在手机和 Mac 的 BLE 链路传输，不经过互联网。
+- 蓝牙和局域网直连都是应用层明文；它们适合个人近距离/可信网络。Tailscale 由 WireGuard 加密。
+- 云中转使用 TLS + 端到端 AES-256-GCM：服务器只看到 channel、随机消息 ID、密文和时间戳，看不到通知正文。中继密钥等同于账号密码，泄露后应重新生成。
 - 配对码有 6 位，连续错误 5 次会断开。
 - 为了自动重连，Mac 会把配对码保存在本机应用偏好设置中（**未做 Keychain/生物识别保护**）。能登录这台 Mac 用户账号的进程理论上可以读到它。
-- **当前 BLE 链路未做应用层加密**，配对码和通知正文在链路上是明文。它适合个人近距离使用，不适合传敏感信息或企业环境。生产化建议见协议文档的“安全边界”。
+- 当前没有证书固定；自签名证书只能用于测试。生产化建议见 [docs/network.md](docs/network.md) 和 [docs/protocol.md](docs/protocol.md) 的“安全边界”。
 
 ### 手机离开范围后会自动重连吗？
 
@@ -300,7 +389,9 @@ iOS 没有“通知监听”公开 API，第三方 App 只能处理自己的通�
 
 - 手机端在 30 秒收不到 Mac 心跳时，主动判断连接已断并重新广播。
 - Mac 持续扫描，发现保存过的手机后自动连接，并自动重发配对码。
+- 网络通道独立重连：局域网断开、Tailscale 路径变化、云中转断线都会按 2/5/15/30/60/120 秒退避重试。
 - Mac 重启、手机蓝牙重启后也会恢复。
+- 如果手机已经离开蓝牙范围，但还在同一个 Wi-Fi / tailnet，网络通道会继续送达；不需要手动切换。
 
 注意：
 
@@ -320,6 +411,7 @@ ad-hoc 签名每次构建都会变化，macOS 会把它当成新的二进制重�
 1. 在系统弹窗中允许蓝牙；如果没看到弹窗，打开系统设置 → 隐私与安全性 → 蓝牙，允许「通知桥」。
 2. 退出并重新打开通知桥。
 3. 菜单状态应先变成「正在搜索附近的手机…」。
+4. 如果状态停在「正在连接…」超过十几秒，点菜单里的「重置蓝牙连接」；新版也会在超时后自动重置。
 
 ### 通知只在通知中心，没有桌面横幅？
 
@@ -346,10 +438,19 @@ Android 厂商的后台策略差异很大。可以：
 按顺序检查：
 
 1. Mac 系统设置 → 通知 → 通知桥：允许通知，样式不是“无”。
-2. 菜单栏状态是否为「已连接并已配对」。
-3. 手机端是否显示「Mac 已连接并配对」。
+2. 菜单栏状态是否显示至少一条已连接路径（蓝牙 / 局域网 / 远程直连 / 云中转），以及「网络：」那一行。
+3. 手机端是否显示「Mac 已连接并配对」或网络通道已连接。
 4. 手机通知本身是否显示内容。
 5. 查看 `~/Library/Logs/NotifyBridge.log` 是否有连接/投递错误。
+
+### 网络通道显示已连接，但 Mac 还是不弹？
+
+1. 手机「通知访问」是否仍然开启（覆盖安装/重装后可能被系统撤销）。
+2. 点手机上的「发送测试消息到 Mac」：能到说明通道正常，问题在通知监听或来源 App 的通知设置。
+3. 云中转：两端的中继地址、密钥是否完全一致；手机生成新密钥后，Mac 必须重新粘贴。
+4. Tailscale：Mac 是否能 `ping` 到手机的 tailnet 地址，ACL 是否允许 47821 入站。
+5. 局域网：路由器是否开启 AP 隔离/访客网络；可改用 Tailscale 或云中转。
+6. 查看 Mac 日志中的 `Direct network paired`、`Cloud relay delivered` 和 `Delivered notification`。
 
 ---
 
@@ -357,14 +458,17 @@ Android 厂商的后台策略差异很大。可以：
 
 ```text
 android/                       Android 客户端（Kotlin，无第三方运行时依赖）
-  app/src/main/java/...        Activity、通知监听、BLE 服务、帧协议
+  app/src/main/java/...        Activity、通知监听、BLE 服务、TCP 服务、云客户端、帧/加密
 macos/                         macOS 接收端（Swift Package）
-  Sources/NotifyBridgeCore/    BLE 帧协议与 JSON 模型
-  Sources/NotifyBridge/        菜单栏 App、CoreBluetooth、通知中心
+  Sources/NotifyBridgeCore/    BLE 帧协议、TCP 分帧、HKDF/AES-GCM
+  Sources/NotifyBridge/        菜单栏 App、CoreBluetooth、直连/云中转接收器、通知中心
   Sources/ProtocolSelfTest/    无 XCTest 依赖的协议自测
+server/                        自建 TLS 中继（Node.js，无 npm 依赖）
 scripts/build-macos.sh         构建 .app
+scripts/gen-relay-cert.sh      生成测试证书
 scripts/make_icon.py           生成图标
 docs/protocol.md               BLE 协议与安全说明
+docs/network.md                网络通道协议、部署与安全边界
 dist/                          构建产物（.app/.dmg/.zip/.apk）
 ```
 
@@ -372,10 +476,11 @@ dist/                          构建产物（.app/.dmg/.zip/.apk）
 
 ## 设计取舍与后续方向
 
-当前版本刻意保持“单机、本地、无账号”：
+默认保持“单机、本地、无账号”；云中转是可选的，账号体系仍然没有：
 
-- 手机只作为 BLE 外设；Mac 主动连接。
-- 没有云端中转，因此不能跨网络、不能离线后补发。
+- 手机是通知源和 TCP 服务端；Mac 主动连接。BLE 仍是最省电的近场路径。
+- 默认本地直连；云中转是可选的，服务器只转发端到端密文，不做账号体系。
+- 多通道并发而不是硬切换：任何一条可用路径都能送达，重复通知按 ID + 发送时间去重。
 - 不读取微信数据库、不注入微信、不申请无障碍权限。
 - 不做通知点击跳转回手机（需要额外的协议和 Android 端处理）。
 

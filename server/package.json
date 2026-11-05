@@ -1,0 +1,14 @@
+{
+  "name": "notifybridge-relay",
+  "version": "0.2.1",
+  "private": true,
+  "description": "Self-hosted TLS store-and-forward relay for NotifyBridge",
+  "main": "relay.js",
+  "scripts": {
+    "start": "node relay.js",
+    "test": "node test/relay-test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -35,6 +35,7 @@ import android.os.Looper
 import android.os.ParcelUuid
 import android.os.SystemClock
 import android.provider.Settings
+import android.service.notification.NotificationListenerService
 import android.util.Log
 import org.json.JSONObject
 import java.nio.charset.StandardCharsets
@@ -48,6 +49,7 @@ class NotificationRelayService : Service() {
         private const val TAG = "NotifyBridge"
         const val ACTION_STOP = "com.notifybridge.app.action.STOP"
         const val ACTION_REFRESH_PIN = "com.notifybridge.app.action.REFRESH_PIN"
+        const val ACTION_RELOAD_NETWORK = "com.notifybridge.app.action.RELOAD_NETWORK"
 
         private const val CHANNEL_ID = "notifybridge.relay"
         private const val NOTIFICATION_ID = 1001
@@ -55,6 +57,9 @@ class NotificationRelayService : Service() {
         private const val MAC_HEARTBEAT_TIMEOUT_MS = 30_000L
         private const val MAC_WATCHDOG_INTERVAL_MS = 4_000L
         private const val SEND_TIMEOUT_MS = 8_000L
+        private const val SUBSCRIBE_TIMEOUT_MS = 15_000L
+        private const val ADVERTISING_WATCHDOG_INTERVAL_MS = 60_000L
+        private const val ADVERTISING_RECYCLE_MS = 5 * 60_000L
         private const val MANUFACTURER_ID = 0xFFFF
     }
 
@@ -70,6 +75,7 @@ class NotificationRelayService : Service() {
     @Volatile private var isSubscribed = false
     @Volatile private var isPaired = false
     @Volatile private var isAdvertising = false
+    @Volatile private var advertisingStartedElapsed = 0L
     @Volatile private var isSending = false
     @Volatile private var pin = ""
     @Volatile private var destroyed = false
@@ -77,6 +83,10 @@ class NotificationRelayService : Service() {
     private var failedAttempts = 0
     private var bluetoothReceiverRegistered = false
     private var sendTimeoutRunnable: Runnable? = null
+    private var subscribeTimeoutRunnable: Runnable? = null
+    private var advertiseRetryDelayMs = 5_000L
+    private var networkRelay: NetworkRelayManager? = null
+    private var lastListenerConnected: Boolean? = null
 
     private val incomingReassembler = FrameReassembler()
     private val outgoingLock = Any()
@@ -111,7 +121,10 @@ class NotificationRelayService : Service() {
             stopSelf()
             return
         }
+        startNetworkRelay()
         startGattServer()
+        mainHandler.postDelayed(listenerWatchdog, 15_000)
+        mainHandler.postDelayed(advertisingWatchdog, ADVERTISING_WATCHDOG_INTERVAL_MS)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -123,7 +136,12 @@ class NotificationRelayService : Service() {
             ACTION_REFRESH_PIN -> {
                 pin = PinStore.refresh(this)
                 failedAttempts = 0
+                networkRelay?.updatePin()
                 setBluetoothState("配对码已刷新")
+                updateForegroundNotification()
+            }
+            ACTION_RELOAD_NETWORK -> {
+                networkRelay?.reload()
                 updateForegroundNotification()
             }
         }
@@ -131,6 +149,7 @@ class NotificationRelayService : Service() {
         if (!RelayState.isRunning) {
             RelayState.isRunning = true
             startForegroundCompat()
+            startNetworkRelay()
             startGattServer()
         } else {
             updateForegroundNotification()
@@ -146,9 +165,18 @@ class NotificationRelayService : Service() {
         RelayState.centralConnected = false
         RelayState.paired = false
         RelayState.bluetoothState = "已停止"
+        networkRelay?.stop()
+        networkRelay = null
+        RelayState.lanState = "局域网：已停止"
+        RelayState.lanClients = 0
+        RelayState.cloudState = "云中转：未配置"
+        RelayState.cloudConnected = false
         NotificationHub.setSink(null)
+        mainHandler.removeCallbacks(listenerWatchdog)
+        mainHandler.removeCallbacks(advertisingWatchdog)
         stopMacWatchdog()
         disarmSendTimeout()
+        disarmSubscribeTimeout()
         unregisterBluetoothStateReceiver()
         stopAdvertising()
         try {
@@ -167,6 +195,31 @@ class NotificationRelayService : Service() {
     }
 
     // MARK: - Connection liveness and Bluetooth state
+
+    private val listenerWatchdog = object : Runnable {
+        override fun run() {
+            if (destroyed) return
+            val listenerConnected = RelayState.listenerConnected
+            if (lastListenerConnected != null && lastListenerConnected != listenerConnected && isPaired) {
+                sendStatus(
+                    "paired",
+                    if (listenerConnected && isNotificationAccessEnabled()) "notifications=on" else "notifications=off"
+                )
+            }
+            lastListenerConnected = listenerConnected
+            if (isNotificationAccessEnabled() && !listenerConnected) {
+                Log.w(TAG, "Notification listener is not connected; requesting rebind")
+                try {
+                    NotificationListenerService.requestRebind(
+                        ComponentName(this@NotificationRelayService, NotificationCollectorService::class.java)
+                    )
+                } catch (e: Exception) {
+                    Log.w(TAG, "Unable to request notification listener rebind", e)
+                }
+            }
+            mainHandler.postDelayed(this, 60_000)
+        }
+    }
 
     private val macWatchdog = object : Runnable {
         override fun run() {
@@ -187,6 +240,64 @@ class NotificationRelayService : Service() {
 
     private fun stopMacWatchdog() {
         mainHandler.removeCallbacks(macWatchdog)
+    }
+
+    /**
+     * Android gives no callback when the Bluetooth stack silently drops the
+     * advertising set (stack restart, a central that vanished without a
+     * disconnect, or a failed start). Verify it periodically and recycle it so
+     * the phone cannot stay invisible to the Mac for hours.
+     */
+    private val advertisingWatchdog = object : Runnable {
+        override fun run() {
+            if (destroyed) return
+            if (gattServer == null) {
+                if (bluetoothManager.adapter?.isEnabled == true && hasBluetoothPermissions()) {
+                    Log.w(TAG, "GATT server is missing; recreating")
+                    startGattServer()
+                }
+                mainHandler.postDelayed(this, ADVERTISING_WATCHDOG_INTERVAL_MS)
+                return
+            }
+            if (connectedDevice == null) {
+                if (!isAdvertising) {
+                    Log.w(TAG, "BLE advertising is not running; restarting")
+                    startAdvertising()
+                } else if (SystemClock.elapsedRealtime() - advertisingStartedElapsed >= ADVERTISING_RECYCLE_MS) {
+                    Log.i(TAG, "Recycling the BLE advertising set")
+                    stopAdvertising()
+                    mainHandler.postDelayed({ startAdvertising() }, 300)
+                }
+            }
+            mainHandler.postDelayed(this, ADVERTISING_WATCHDOG_INTERVAL_MS)
+        }
+    }
+
+    /**
+     * A central can connect and then never write the CCCD (the Mac slept
+     * mid-handshake). Keeping that half-open link stops advertising and blocks
+     * the real reconnect, so drop it after a few seconds.
+     */
+    private fun armSubscribeTimeout(device: BluetoothDevice) {
+        disarmSubscribeTimeout()
+        val runnable = Runnable {
+            subscribeTimeoutRunnable = null
+            if (isSubscribed || connectedDevice != device) return@Runnable
+            Log.w(TAG, "Central connected but never subscribed; resetting the link")
+            setBluetoothState("Mac 连接后未完成订阅，正在重置…")
+            try {
+                gattServer?.cancelConnection(device)
+            } catch (e: Exception) {
+                Log.w(TAG, "Unable to reset a half-open connection", e)
+            }
+        }
+        subscribeTimeoutRunnable = runnable
+        mainHandler.postDelayed(runnable, SUBSCRIBE_TIMEOUT_MS)
+    }
+
+    private fun disarmSubscribeTimeout() {
+        subscribeTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+        subscribeTimeoutRunnable = null
     }
 
     private fun disarmSendTimeout() {
@@ -292,6 +403,9 @@ class NotificationRelayService : Service() {
         rxCharacteristic = null
         connectedDevice = null
         isSubscribed = false
+        isAdvertising = false
+        advertisingStartedElapsed = 0L
+        advertiseRetryDelayMs = 5_000L
         isPaired = false
         incomingReassembler.reset()
         synchronized(outgoingLock) {
@@ -360,9 +474,11 @@ class NotificationRelayService : Service() {
         )
 
         val text = when {
-            isPaired -> "已连接 Mac，通知会实时同步"
-            RelayState.centralConnected -> "Mac 已连接，请在手机 App 中确认配对码"
-            else -> "等待 Mac 连接 · 配对码见 App"
+            isPaired && RelayState.networkPaired -> "已连接 Mac（蓝牙 + 网络），通知会实时同步"
+            isPaired -> "已连接 Mac（蓝牙），通知会实时同步"
+            RelayState.networkPaired -> "已连接 Mac（网络），通知会实时同步"
+            RelayState.centralConnected -> "Mac 已连接，请在手机 App 中输入配对码"
+            else -> "等待 Mac 连接（蓝牙 / 网络）· 配对码见 App"
         }
 
         return Notification.Builder(this, CHANNEL_ID)
@@ -451,6 +567,12 @@ class NotificationRelayService : Service() {
             setBluetoothState("正在注册蓝牙服务…")
 
             if (!server.addService(service)) {
+                gattServer = null
+                try {
+                    server.close()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Unable to close the rejected GATT server", e)
+                }
                 fail("注册蓝牙服务失败")
             }
         } catch (e: SecurityException) {
@@ -484,6 +606,7 @@ class NotificationRelayService : Service() {
         try {
             adv.startAdvertising(settings, data, scanResponse, advertiseCallback)
             isAdvertising = true
+            advertisingStartedElapsed = SystemClock.elapsedRealtime()
             setBluetoothState("正在开启蓝牙广播…")
         } catch (e: SecurityException) {
             fail("没有蓝牙广播权限")
@@ -541,12 +664,15 @@ class NotificationRelayService : Service() {
             }
             RelayState.centralConnected = false
             RelayState.paired = false
+            advertisingStartedElapsed = SystemClock.elapsedRealtime()
+            advertiseRetryDelayMs = 5_000L
             setBluetoothState("等待 Mac 连接")
             Log.i(TAG, "BLE advertising started")
         }
 
         override fun onStartFailure(errorCode: Int) {
             isAdvertising = false
+            advertisingStartedElapsed = 0L
             val reason = when (errorCode) {
                 ADVERTISE_FAILED_DATA_TOO_LARGE -> "蓝牙广播数据过大"
                 ADVERTISE_FAILED_TOO_MANY_ADVERTISERS -> "蓝牙广播数量已达上限"
@@ -556,6 +682,19 @@ class NotificationRelayService : Service() {
                 else -> "启动蓝牙广播失败（$errorCode）"
             }
             fail(reason)
+            if (errorCode == ADVERTISE_FAILED_ALREADY_STARTED) {
+                // Someone else owns the advertising set; treat it as running and
+                // let the watchdog recycle it instead of retrying in a loop.
+                isAdvertising = true
+                advertisingStartedElapsed = SystemClock.elapsedRealtime()
+                return
+            }
+            if (!destroyed && connectedDevice == null) {
+                val delay = advertiseRetryDelayMs
+                advertiseRetryDelayMs = minOf(delay * 2, 60_000L)
+                Log.w(TAG, "Retrying BLE advertising in ${delay}ms")
+                mainHandler.postDelayed({ startAdvertising() }, delay)
+            }
         }
     }
 
@@ -566,6 +705,16 @@ class NotificationRelayService : Service() {
             if (status == BluetoothGatt.GATT_SUCCESS && service?.uuid == BleProtocol.SERVICE_UUID) {
                 startAdvertising()
             } else {
+                // Let the advertising watchdog rebuild the server instead of
+                // leaving a half-registered one that can never serve the Mac.
+                try {
+                    gattServer?.close()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Unable to close the failed GATT server", e)
+                }
+                gattServer = null
+                txCharacteristic = null
+                rxCharacteristic = null
                 fail("注册蓝牙服务失败（$status）")
             }
         }
@@ -573,9 +722,25 @@ class NotificationRelayService : Service() {
         override fun onConnectionStateChange(device: BluetoothDevice?, status: Int, newState: Int) {
             if (device == null) return
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                val existing = connectedDevice
+                if (existing != null && existing != device) {
+                    // A stale central can keep a GATT connection alive while the
+                    // Mac reconnects. Overwriting connectedDevice would make the
+                    // phone silently drop the new Mac's commands (including the
+                    // pairing code), so reject the extra link instead.
+                    Log.w(TAG, "Rejecting a second central while another is connected")
+                    try {
+                        gattServer?.cancelConnection(device)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Unable to reject the second central", e)
+                    }
+                    return
+                }
                 connectedDevice = device
                 lastMacContactElapsed = SystemClock.elapsedRealtime()
                 disarmSendTimeout()
+                disarmSubscribeTimeout()
+                armSubscribeTimeout(device)
                 stopAdvertising()
                 isSubscribed = false
                 isPaired = false
@@ -593,6 +758,7 @@ class NotificationRelayService : Service() {
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 stopMacWatchdog()
                 disarmSendTimeout()
+                disarmSubscribeTimeout()
                 if (connectedDevice == device) {
                     connectedDevice = null
                     isSubscribed = false
@@ -625,9 +791,13 @@ class NotificationRelayService : Service() {
             var success = false
             var enabled = false
             if (descriptor != null && descriptor.uuid == BleProtocol.CCCD_UUID) {
-                enabled = value != null && value.isNotEmpty() && (value[0].toInt() and 0x01) != 0
-                isSubscribed = enabled
-                success = true
+                if (device != connectedDevice) {
+                    Log.w(TAG, "Ignoring CCCD write from a non-current central")
+                } else {
+                    enabled = value != null && value.isNotEmpty() && (value[0].toInt() and 0x01) != 0
+                    isSubscribed = enabled
+                    success = true
+                }
             }
 
             if (responseNeeded) {
@@ -645,6 +815,7 @@ class NotificationRelayService : Service() {
             }
 
             if (success && enabled) {
+                disarmSubscribeTimeout()
                 lastMacContactElapsed = SystemClock.elapsedRealtime()
                 startMacWatchdog()
                 RelayState.centralConnected = true
@@ -666,10 +837,11 @@ class NotificationRelayService : Service() {
         ) {
             if (device == null) return
             val isRx = characteristic?.uuid == BleProtocol.RX_UUID
-            if (isRx) {
+            val fromCurrentDevice = device == connectedDevice
+            val valid = isRx && fromCurrentDevice && !preparedWrite && offset == 0 && value != null
+            if (valid) {
                 lastMacContactElapsed = SystemClock.elapsedRealtime()
             }
-            val valid = isRx && !preparedWrite && offset == 0 && value != null
 
             if (responseNeeded) {
                 try {
@@ -754,14 +926,25 @@ class NotificationRelayService : Service() {
             failedAttempts = 0
             RelayState.paired = true
             RelayState.lastError = null
-            val notificationAccess = isNotificationAccessEnabled()
-            RelayState.listenerConnected = notificationAccess
-            setBluetoothState(if (notificationAccess) "已连接并配对" else "已连接并配对，但通知访问未开启")
+            val permission = isNotificationAccessEnabled()
+            // Do not copy the permission bit into listenerConnected: the system
+            // may keep the permission while the listener service is dead. The
+            // collector owns the real connection state, and the watchdog
+            // rebinds when it is false.
+            val listenerReady = permission && RelayState.listenerConnected
+            setBluetoothState(
+                when {
+                    listenerReady -> "已连接并配对"
+                    permission -> "已连接并配对，但通知监听未连接"
+                    else -> "已连接并配对，但通知访问未开启"
+                }
+            )
             sendStatus(
                 "paired",
-                if (notificationAccess) "notifications=on" else "notifications=off"
+                if (listenerReady) "notifications=on" else "notifications=off"
             )
-            Log.i(TAG, "Pairing succeeded (notification access: $notificationAccess)")
+            lastListenerConnected = listenerReady
+            Log.i(TAG, "Pairing succeeded (permission=$permission, listener=$listenerReady)")
             return
         }
 
@@ -783,8 +966,24 @@ class NotificationRelayService : Service() {
     }
 
     private fun publish(json: String) {
+        // Network channels are independent of BLE. They keep working while the
+        // phone is out of Bluetooth range or the Mac is remote.
+        networkRelay?.publish(json)
         if (!isPaired || !isSubscribed || connectedDevice == null) return
         enqueue(json, requirePaired = true)
+    }
+
+    private fun startNetworkRelay() {
+        if (networkRelay != null) return
+        val manager = NetworkRelayManager(
+            this,
+            { pin },
+            { isNotificationAccessEnabled() && RelayState.listenerConnected }
+        ) {
+            mainHandler.post { updateForegroundNotification() }
+        }
+        networkRelay = manager
+        manager.start()
     }
 
     private fun sendStatus(state: String, detail: String?) {

@@ -9,6 +9,11 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
 
     private let deliveryLock = NSLock()
     private var recentDeliveries: [String: Date] = [:]
+    /// A notification can arrive over BLE, LAN and the relay almost at once.
+    /// The phone's stable id plus post time is identical on every path, so it
+    /// is a reliable cross-transport dedupe key while still letting a genuine
+    /// update (new post time) through.
+    private var deliveredKeys: [String: Date] = [:]
 
     func configure() {
         UNUserNotificationCenter.current().delegate = self
@@ -77,6 +82,11 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
             AppLogger.info("Suppressed duplicate notification")
             return
         }
+        let deliveryKey = "\(identifier)|\(message.time.map(String.init) ?? "-")"
+        if isAlreadyDelivered(deliveryKey) {
+            AppLogger.info("Suppressed cross-transport duplicate notification")
+            return
+        }
 
         let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request) { error in
@@ -139,6 +149,21 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
             self.authorizationGranted = granted
             self.onAuthorizationChange?(granted)
         }
+    }
+
+    private func isAlreadyDelivered(_ key: String) -> Bool {
+        deliveryLock.lock()
+        defer { deliveryLock.unlock() }
+        let now = Date()
+        deliveredKeys = deliveredKeys.filter { now.timeIntervalSince($0.value) < 24 * 60 * 60 }
+        if let previous = deliveredKeys[key], now.timeIntervalSince(previous) < 24 * 60 * 60 {
+            return true
+        }
+        deliveredKeys[key] = now
+        if deliveredKeys.count > 1_000 {
+            deliveredKeys = deliveredKeys.sorted { $0.value > $1.value }.prefix(500).reduce(into: [:]) { $0[$1.key] = $1.value }
+        }
+        return false
     }
 
     private func isRecentDuplicate(_ fingerprint: String) -> Bool {

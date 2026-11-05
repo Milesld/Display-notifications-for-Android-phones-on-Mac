@@ -8,6 +8,7 @@ enum PairingVault {
     private static let knownDeviceIDKey = "NotifyBridge.knownDeviceID"
     private static let knownPeripheralKey = "NotifyBridge.knownPeripheralUUID"
     private static let autoReconnectKey = "NotifyBridge.autoReconnect"
+    private static let pinRejectedKey = "NotifyBridge.pinRejected"
 
     private static var defaults: UserDefaults { .standard }
 
@@ -26,6 +27,7 @@ enum PairingVault {
 
     static func clearPin() {
         defaults.removeObject(forKey: pinKey)
+        defaults.removeObject(forKey: pinRejectedKey)
     }
 
     static var knownDeviceID: String? {
@@ -56,6 +58,14 @@ enum PairingVault {
             return defaults.bool(forKey: autoReconnectKey)
         }
         set { defaults.set(newValue, forKey: autoReconnectKey) }
+    }
+
+    /// True after the phone rejected the saved PIN. The PIN itself is kept:
+    /// the link stays usable and the user only has to type the new code, instead
+    /// of losing auto reconnect until a full manual pairing.
+    static var pinRejected: Bool {
+        get { defaults.bool(forKey: pinRejectedKey) }
+        set { defaults.set(newValue, forKey: pinRejectedKey) }
     }
 
     static func forget() {

@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import CoreBluetooth
 import NotifyBridgeCore
 
@@ -44,9 +45,17 @@ final class BluetoothReceiver: NSObject {
     private var rescanWorkItem: DispatchWorkItem?
     private var heartbeatTimer: Timer?
     private var writeTimeoutTimer: Timer?
+    private var connectionWatchdog: Timer?
+    private var heartbeatActivity: NSObjectProtocol?
+    private var wakeObservers: [NSObjectProtocol] = []
+    private var isSystemSleeping = false
+    private var automaticConnection = false
+    private var pinRejected = false
 
     private(set) var statusText = "正在初始化蓝牙…"
     private(set) var isPaired = false
+    /// nil = unknown (old phone), true/false = phone reported notification access.
+    private(set) var phoneNotificationsEnabled: Bool?
 
     var autoReconnectEnabled: Bool = PairingVault.autoReconnectEnabled {
         didSet {
@@ -102,6 +111,8 @@ final class BluetoothReceiver: NSObject {
         savedPin = PairingVault.loadPin()
         knownDeviceID = PairingVault.knownDeviceID
         knownPeripheralUUID = PairingVault.knownPeripheralUUID.flatMap { UUID(uuidString: $0) }
+        pinRejected = PairingVault.pinRejected
+        registerSystemSleepObservers()
         AppLogger.info("Starting Bluetooth receiver (auto reconnect: \(autoReconnectEnabled), saved pairing: \(savedPin != nil))")
         central = CBCentralManager(
             delegate: self,
@@ -114,6 +125,7 @@ final class BluetoothReceiver: NSObject {
         started = false
         rescanWorkItem?.cancel()
         rescanWorkItem = nil
+        unregisterSystemSleepObservers()
         stopTimers()
         central?.stopScan()
         if let peripheral, peripheral.state != .disconnected {
@@ -182,9 +194,13 @@ final class BluetoothReceiver: NSObject {
         }
         activePin = pin
         isPaired = false
+        pinRejected = false
+        PairingVault.pinRejected = false
+        automaticConnection = false
         autoReconnectSuspended = false
         setStatus("正在重新配对…")
         sendPairing()
+        armConnectionWatchdog(12, reason: "配对无响应")
     }
 
     func disconnect() {
@@ -201,12 +217,34 @@ final class BluetoothReceiver: NSObject {
         central?.cancelPeripheralConnection(peripheral)
     }
 
+    /// Manual escape hatch for a half-open session: drop any pending request,
+    /// forget the backoff and scan again without relaunching the app.
+    func resetBluetoothSession() {
+        guard started else { return }
+        AppLogger.info("Manual BLE session reset")
+        rescanWorkItem?.cancel()
+        rescanWorkItem = nil
+        stopConnectionWatchdog()
+        pendingRetryPin = nil
+        pendingRetryDeviceID = nil
+        isRetryAttempt = false
+        consecutiveConnectionFailures = 0
+        reconnectCooldownUntil = nil
+        autoReconnectSuspended = false
+        if let peripheral {
+            central?.cancelPeripheralConnection(peripheral)
+            cleanupConnection()
+        }
+        scan()
+    }
+
     func forgetPairing() {
         PairingVault.forget()
         savedPin = nil
         knownDeviceID = nil
         knownPeripheralUUID = nil
         activePin = nil
+        pinRejected = false
         autoReconnectSuspended = true
         pendingRetryPin = nil
         pendingRetryDeviceID = nil
@@ -259,6 +297,7 @@ final class BluetoothReceiver: NSObject {
         guard peripheral == nil else { return }
         activePin = pin
         activeDeviceID = discoveredDeviceIDs[target.identifier]
+        automaticConnection = automatic
         isPaired = false
         manualDisconnectRequested = false
         target.delegate = self
@@ -266,6 +305,7 @@ final class BluetoothReceiver: NSObject {
         central?.stopScan()
         let name = discoveredNames[target.identifier] ?? target.name ?? "手机"
         setStatus(automatic ? "发现已配对手机，正在自动连接…" : "正在连接 \(name)…")
+        armConnectionWatchdog(15, reason: "连接手机超时")
         central?.connect(target, options: nil)
     }
 
@@ -303,6 +343,106 @@ final class BluetoothReceiver: NSObject {
         scheduleRescan(after: delay)
     }
 
+    // MARK: - Sleep and wake
+
+    /// macOS powers the Bluetooth controller down for every system sleep, and
+    /// this machine wakes and sleeps again every minute or so when idle.
+    /// Treating each of those power transitions as "the user turned Bluetooth
+    /// off" tore the session down and started a fresh scan dozens of times an
+    /// hour, so a link could never survive the night.
+    private func registerSystemSleepObservers() {
+        guard wakeObservers.isEmpty else { return }
+        let center = NSWorkspace.shared.notificationCenter
+        wakeObservers.append(center.addObserver(
+            forName: NSWorkspace.willSleepNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.isSystemSleeping = true
+            AppLogger.info("System is going to sleep; BLE session will be rebuilt on wake")
+        })
+        wakeObservers.append(center.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.isSystemSleeping = false
+            self.resumeAfterWake()
+        })
+    }
+
+    private func unregisterSystemSleepObservers() {
+        let center = NSWorkspace.shared.notificationCenter
+        wakeObservers.forEach { center.removeObserver($0) }
+        wakeObservers.removeAll()
+    }
+
+    /// A pending connect survives sleep in a half-open state, and failures
+    /// accumulated overnight leave the reconnect cooldown at several minutes.
+    /// On wake we drop the stale request, reset the backoff, and either scan or
+    /// rebuild the central manager if the Bluetooth stack did not come back.
+    private func resumeAfterWake() {
+        guard started else { return }
+        AppLogger.info("System woke; rebuilding the BLE session")
+        rescanWorkItem?.cancel()
+        rescanWorkItem = nil
+        stopConnectionWatchdog()
+        consecutiveConnectionFailures = 0
+        reconnectCooldownUntil = nil
+        if let peripheral {
+            if peripheral.state == .connected, isPaired {
+                // The link survived the nap; the heartbeat (and its write
+                // timeout) will tell us if it is actually dead. Tearing it down
+                // here would force a needless reconnect + re-pair.
+                AppLogger.info("Keeping the existing BLE connection across wake")
+                sendPing()
+            } else {
+                central?.cancelPeripheralConnection(peripheral)
+                cleanupConnection()
+            }
+        }
+        // The controller needs a moment to come back after wake. If it is still
+        // off, the .poweredOn transition below starts the scan; rebuilding the
+        // manager here would churn it on every maintenance wake.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self, self.started, !self.isSystemSleeping, self.peripheral == nil else { return }
+            if let central = self.central, central.state == .poweredOn {
+                self.scan()
+            }
+        }
+    }
+
+    // MARK: - Connection watchdog
+
+    /// CoreBluetooth never times out connect(_:options:), and service discovery
+    /// can hang the same way. Without a watchdog one stuck request leaves the
+    /// peripheral reference set forever: scanning stops, auto reconnect stops,
+    /// and both menu entries stay disabled.
+    private func armConnectionWatchdog(_ seconds: TimeInterval, reason: String) {
+        stopConnectionWatchdog()
+        let timer = Timer(timeInterval: seconds, repeats: false) { [weak self] _ in
+            guard let self, self.peripheral != nil else { return }
+            self.connectionWatchdog = nil
+            AppLogger.error("BLE session timed out: \(reason)")
+            if let peripheral = self.peripheral {
+                self.central?.cancelPeripheralConnection(peripheral)
+            }
+            self.cleanupConnection()
+            self.consecutiveConnectionFailures += 1
+            let delay = self.backoffDelay()
+            self.startCooldown(delay, message: "蓝牙响应超时，\(Int(delay)) 秒后自动重试…")
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        connectionWatchdog = timer
+    }
+
+    private func stopConnectionWatchdog() {
+        connectionWatchdog?.invalidate()
+        connectionWatchdog = nil
+    }
+
     private func isConnectionLimitError(_ error: Error?) -> Bool {
         guard let error else { return false }
         let nsError = error as NSError
@@ -322,7 +462,9 @@ final class BluetoothReceiver: NSObject {
         activePin = nil
         activeDeviceID = nil
         isPaired = false
+        phoneNotificationsEnabled = nil
         manualDisconnectRequested = false
+        automaticConnection = false
     }
 
     // MARK: - Pairing, heartbeat and writes
@@ -347,6 +489,15 @@ final class BluetoothReceiver: NSObject {
 
     private func startHeartbeat() {
         stopHeartbeat()
+        // A menu-bar app with no window is a prime App Nap target; a throttled
+        // heartbeat looks like a dead Mac to the phone, which then drops the
+        // link every 30 seconds.
+        if heartbeatActivity == nil {
+            heartbeatActivity = ProcessInfo.processInfo.beginActivity(
+                options: [.userInitiated, .automaticTerminationDisabled, .suddenTerminationDisabled],
+                reason: "Keep the BLE heartbeat and reconnect loop alive"
+            )
+        }
         sendPing()
         let timer = Timer(timeInterval: 8.0, repeats: true) { [weak self] _ in
             self?.sendPing()
@@ -358,10 +509,15 @@ final class BluetoothReceiver: NSObject {
     private func stopHeartbeat() {
         heartbeatTimer?.invalidate()
         heartbeatTimer = nil
+        if let heartbeatActivity {
+            ProcessInfo.processInfo.endActivity(heartbeatActivity)
+            self.heartbeatActivity = nil
+        }
     }
 
     private func stopTimers() {
         stopHeartbeat()
+        stopConnectionWatchdog()
         writeTimeoutTimer?.invalidate()
         writeTimeoutTimer = nil
     }
@@ -430,7 +586,10 @@ final class BluetoothReceiver: NSObject {
                 }
             case "paired":
                 isPaired = true
+                stopConnectionWatchdog()
                 autoReconnectSuspended = false
+                pinRejected = false
+                PairingVault.pinRejected = false
                 if let pin = activePin {
                     savedPin = pin
                     PairingVault.savePin(pin)
@@ -448,6 +607,7 @@ final class BluetoothReceiver: NSObject {
                     startHeartbeat()
                 }
                 let notificationsOff = message.detail?.contains("notifications=off") == true
+                phoneNotificationsEnabled = !notificationsOff
                 if notificationsOff {
                     setStatus("已连接并已配对，但手机通知访问未开启")
                 } else if autoReconnectEnabled {
@@ -457,13 +617,21 @@ final class BluetoothReceiver: NSObject {
                 }
                 AppLogger.info("Pairing succeeded; saved identity = \(stableID.map { NotifyBridgeIdentity.shortSuffix($0) } ?? "uuid-only")")
             case "pairing_failed":
+                stopConnectionWatchdog()
+                // Keep the link and the saved PIN. A single stale PIN (refreshed
+                // on the phone, app data cleared, or a raced first attempt) used
+                // to wipe the pairing and stop auto reconnect, leaving the Mac
+                // unable to connect until it was paired by hand. Now the link
+                // stays up, automatic pairing is skipped, and the menu keeps an
+                // explicit "输入配对码" entry for the new code.
                 isPaired = false
-                savedPin = nil
-                PairingVault.clearPin()
+                phoneNotificationsEnabled = nil
+                pinRejected = true
+                PairingVault.pinRejected = true
                 activePin = nil
-                autoReconnectSuspended = true
-                setStatus("配对码错误或已失效，请在手机上刷新后手动连接")
-                AppLogger.error("Pairing failed")
+                autoReconnectSuspended = false
+                setStatus("配对码错误或已失效，请点「输入配对码」重新配对")
+                AppLogger.error("Pairing failed; keeping the saved PIN and waiting for a manual PIN")
             default:
                 if let detail = message.detail, !detail.isEmpty {
                     setStatus(detail)
@@ -488,8 +656,13 @@ extension BluetoothReceiver: CBCentralManagerDelegate {
             if peripheral != nil {
                 cleanupConnection()
             }
-            setStatus("蓝牙已关闭，请在系统设置中打开蓝牙")
-            AppLogger.error("Bluetooth is powered off")
+            if isSystemSleeping {
+                setStatus("系统睡眠中，蓝牙已暂停")
+                AppLogger.info("Bluetooth powered off because the system is sleeping")
+            } else {
+                setStatus("蓝牙已关闭，请在系统设置中打开蓝牙")
+                AppLogger.error("Bluetooth is powered off")
+            }
         case .unauthorized:
             if peripheral != nil {
                 cleanupConnection()
@@ -502,7 +675,7 @@ extension BluetoothReceiver: CBCentralManagerDelegate {
         case .resetting:
             setStatus("蓝牙正在重置…")
         case .unknown:
-            setStatus("蓝牙状态未知…")
+            setStatus("蓝牙正在初始化；若弹出权限请求请允许")
         @unknown default:
             setStatus("蓝牙当前不可用")
         }
@@ -548,7 +721,11 @@ extension BluetoothReceiver: CBCentralManagerDelegate {
         if let deviceID {
             discoveredDeviceIDs[peripheral.identifier] = deviceID
         }
-        AppLogger.info("Discovered \(displayName) rssi=\(RSSI.intValue)")
+        let manufacturerText = manufacturerData.map { data -> String in
+            let hex = data.map { String(format: "%02X", $0) }.joined()
+            return "\(data.count)B/\(hex)"
+        } ?? "none"
+        AppLogger.info("Discovered \(displayName) rssi=\(RSSI.intValue) manufacturer=\(manufacturerText)")
         onDevicesChange?(discoveredDeviceNames)
 
         if let pin = pendingRetryPin {
@@ -588,6 +765,7 @@ extension BluetoothReceiver: CBCentralManagerDelegate {
         reconnectCooldownUntil = nil
         peripheral.delegate = self
         setStatus("已连接，正在发现服务…")
+        armConnectionWatchdog(15, reason: "服务发现超时")
         peripheral.discoverServices([CBUUID(string: NotifyBridgeProtocol.serviceUUID)])
     }
 
@@ -721,9 +899,19 @@ extension BluetoothReceiver: CBPeripheralDelegate {
         guard characteristic.uuid == CBUUID(string: NotifyBridgeProtocol.txCharacteristicUUID) else { return }
 
         if characteristic.isNotifying {
-            setStatus("已连接，正在配对…")
+            stopConnectionWatchdog()
             startHeartbeat()
-            sendPairing()
+            if pinRejected && automaticConnection {
+                setStatus("已连接，配对码已失效，请点「输入配对码」")
+                AppLogger.info("Skipping automatic pairing because the saved PIN was rejected")
+            } else {
+                setStatus("已连接，正在配对…")
+                sendPairing()
+                // A frozen phone stack can ACK the GATT write and still never
+                // answer the pairing message; without this the Mac would sit on
+                // "正在配对" forever.
+                armConnectionWatchdog(12, reason: "配对无响应")
+            }
         } else {
             failAndDisconnect("手机没有接受通知订阅")
         }

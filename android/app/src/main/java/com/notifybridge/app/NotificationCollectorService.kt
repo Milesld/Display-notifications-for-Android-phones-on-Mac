@@ -2,6 +2,7 @@ package com.notifybridge.app
 
 import android.app.Notification
 import android.content.ComponentName
+import android.content.Intent
 import android.os.Bundle
 import android.os.SystemClock
 import android.service.notification.NotificationListenerService
@@ -35,6 +36,17 @@ class NotificationCollectorService : NotificationListenerService() {
         super.onListenerConnected()
         RelayState.listenerConnected = true
         Log.i(TAG, "Notification listener connected")
+    }
+
+    /**
+     * A rebind after an app update or a process restart can arrive through
+     * onRebind() without a second onListenerConnected(), which used to leave
+     * the UI stuck on "监听服务未连接" even though notifications were flowing.
+     */
+    override fun onRebind(intent: Intent?) {
+        super.onRebind(intent)
+        RelayState.listenerConnected = true
+        Log.i(TAG, "Notification listener rebound")
     }
 
     override fun onListenerDisconnected() {
