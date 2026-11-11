@@ -11,16 +11,23 @@
 | RX（Mac → 手机） | `9F3A6D20-4C1B-4E8A-9F2D-7B5C1A0E6D03` | Write |
 | CCCD | `00002902-0000-1000-8000-00805f9b34fb` | TX 的订阅描述符 |
 
-手机主广播包含 128-bit 服务 UUID，Mac 使用服务 UUID 过滤扫描。
+手机主广播包含 128-bit 服务 UUID，Mac 使用服务 UUID 过滤扫描；主广播同时带一段 Manufacturer Data，用于稳定识别同一台手机：
 
-扫描响应里带一段 Manufacturer Data，用于稳定识别同一台手机：
+```text
+company ID: 0xFFFF（little-endian: FF FF）
+payload:    4 字节随机设备标识前缀（主广播，31 字节上限内）
+```
+
+扫描响应里再带完整的 8 字节标识：
 
 ```text
 company ID: 0xFFFF（little-endian: FF FF）
 payload:    8 字节随机设备标识（安装 App 时生成，保存在手机私有设置中）
 ```
 
-Android 的 BLE 地址会轮换，CoreBluetooth 的 peripheral UUID 也可能变化，因此不能只靠 UUID 记住手机。Mac 把这段 8 字节标识与配对信息一起保存，重连时按它匹配。
+为什么复制一份到主广播：128-bit 服务 UUID（18 字节）+ 8 字节标识 + flags 会超过 legacy 广播 31 字节的上限，所以完整标识只能放扫描响应；而 macOS 的 CoreBluetooth 在多数情况下只把主广播交给 App（本机日志里 `manufacturer` 长期是 `none`，连设备名也拿不到），扫描响应并不保证合并。把 4 字节前缀放进主广播后，Mac 一定能拿到一个可匹配的标识。
+
+Android 的 BLE 地址会轮换，CoreBluetooth 的 peripheral UUID 也可能变化，因此不能只靠 UUID 记住手机。Mac 把 8 字节标识与配对信息一起保存，重连时按前缀匹配（4 字节命中 8 字节）。如果手机的控制器连“UUID + 4 字节标识”都放不下，App 会收到 `ADVERTISE_FAILED_DATA_TOO_LARGE` 并退回只在扫描响应里携带标识的旧布局，不会卡在广播失败。
 
 ## 帧格式
 
@@ -114,6 +121,7 @@ Mac 在已订阅 TX 后每 8 秒写一次心跳。手机把任何一次 RX 写�
 - 这一条用于处理“手机已经在范围外，但 Android 没及时收到 disconnect 回调”的情况，避免手机界面一直显示已连接。
 - Mac 侧同时有 12 秒写入超时：写入未完成就取消连接并重新扫描。
 - 手机端还有一个 8 秒 TX callback 超时。如果 Android 没有收到 `onNotificationSent`，会主动取消连接，让 Mac 自动重连，避免通知发送队列卡死后永久收不到消息。
+- 同一时间只服务一个 central。旧链路 10 秒内还有心跳时，新 central 会被拒绝（避免两条链路互相抢写）；超过 10 秒没有心跳（Mac 睡眠、App 被冻结、对端消失）则视为遗留链路，手机主动断开它并接受新连接。否则一条收不到心跳、又等不到 disconnect 回调的旧链路会永久拒绝所有重连。
 
 ## 连接与配对流程
 

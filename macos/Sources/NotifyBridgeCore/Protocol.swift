@@ -142,24 +142,41 @@ public enum BLEFrameCodec {
 public enum NotifyBridgeIdentity {
     public static let manufacturerCompanyID: UInt16 = 0xFFFF
     public static let byteCount = 8
+    /// The primary advertising packet cannot hold the 128-bit service UUID and
+    /// the full 8-byte identity at once (31-byte limit), and CoreBluetooth does
+    /// not reliably merge the scan response into the advertisement dictionary.
+    /// Android therefore repeats the first four bytes in the main packet.
+    public static let shortByteCount = 4
 
     public static func parseDeviceID(fromManufacturerData data: Data?) -> String? {
         guard let data else { return nil }
         let payload: Data
-        if data.count == byteCount + 2 {
+        switch data.count {
+        case byteCount + 2, shortByteCount + 2:
             let first = data[data.startIndex]
             let second = data[data.startIndex + 1]
             let company = UInt16(first) | (UInt16(second) << 8)
             guard company == manufacturerCompanyID else { return nil }
             payload = data.dropFirst(2)
-        } else if data.count == byteCount {
+        case byteCount, shortByteCount:
             // Some stacks (and some macOS builds) hand back the manufacturer
             // payload without the two-byte company identifier.
             payload = data
-        } else {
+        default:
             return nil
         }
         return payload.map { String(format: "%02X", $0) }.joined()
+    }
+
+    /// True when two identities refer to the same phone. A 4-byte identity from
+    /// the main advertising packet is a prefix of the full 8-byte identity
+    /// stored at pairing time, so prefix matching keeps auto reconnect working
+    /// even if only the short form ever arrives.
+    public static func matches(_ lhs: String, _ rhs: String) -> Bool {
+        let a = lhs.uppercased()
+        let b = rhs.uppercased()
+        guard !a.isEmpty, !b.isEmpty else { return false }
+        return a.hasPrefix(b) || b.hasPrefix(a)
     }
 
     public static func manufacturerData(fromDeviceID id: String) -> Data? {

@@ -135,9 +135,9 @@ NotificationHub
 构建产物通过 GitHub Releases 发布，二进制不进 Git（`dist/` 只保留 `SHA256SUMS.txt`）：
 
 - 最新发布：<https://github.com/Milesld/Display-notifications-for-Android-phones-on-Mac/releases/latest>
-- `NotifyBridge-macOS-0.2.2.dmg`：Mac 安装包（Apple Silicon；本次发布 Mac 端代码未改动）。
-- `NotifyBridge-macOS-0.2.2.zip`：同样的 `.app` 压缩包。
-- `NotifyBridge-Android-0.2.5-debug.apk`：可直接安装的 Android debug 包。
+- `NotifyBridge-macOS-0.2.3.dmg`：Mac 安装包（Apple Silicon；含睡眠后遗留链路自愈）。
+- `NotifyBridge-macOS-0.2.3.zip`：同样的 `.app` 压缩包。
+- `NotifyBridge-Android-0.2.6-debug.apk`：可直接安装的 Android debug 包（含遗留链路回收与主广播设备标识）。
 - `SHA256SUMS.txt`：三个产物的校验和。
 
 Mac 端没有经过 Apple 公证（ad-hoc 签名），首次打开如果被 Gatekeeper 拦住，右键 App →「打开」。Android 包使用 debug 签名，适合自用测试，不适合上架。
@@ -261,10 +261,14 @@ Mac 菜单里的「状态」会显示当前可用路径，例如「已连接：�
   - 心跳期间禁止 App Nap，避免 8 秒心跳被系统节流后触发手机端 30 秒超时。
   - 菜单新增「重置蓝牙连接」，卡住时一键丢弃挂起请求并重新扫描。
   - Android 端增加广播看门狗（广播丢失/失败会自动重启）、半开连接 15 秒回收、拒绝第二个 central，并对非当前设备的写入返回失败而不是静默丢弃。
-- Android 首页布局（0.2.3）：把 6 位配对码卡片移到网络通道卡片之前；启动同步、刷新配对码，或在未配对时重新打开 App，页面会自动滚到配对码，不用再手动下拉。Mac 端仍为 0.2.2，两端协议不变，可混装。
+- Android 首页布局（0.2.3）：把 6 位配对码卡片移到网络通道卡片之前；启动同步、刷新配对码，或在未配对时重新打开 App，页面会自动滚到配对码，不用再手动下拉。当时的 Mac 端仍为 0.2.2，两端协议不变，可混装。
 - Android 文案（0.2.4）：第二步「启动蓝牙同步」改为「启动同步服务」；卡片内「连接状态 / 蓝牙」改为「同步状态 / 蓝牙通道」，同步状态会标明当前走蓝牙、网络，还是两者都有；前台通知也按通道显示。
 - 通知监听修复（0.2.5）：已授权但监听服务未连接时，点「重新连接通知监听」会请求重绑并直接打开系统通知访问页，不再只弹一句 toast；监听被系统重绑（onRebind）时也会把状态更新为已连接，不会卡在「监听服务未连接」。
 - 通知权限诊断：macOS 系统日志显示通知已按 banner 投递（`Presenting ... as banner`），但被当前启用的专注模式以 `DND suppression: delay` 暂缓，因此只进入通知中心。系统设置中的通知桥样式为「横幅」。
+- 遗留链路修复（Android 0.2.6 / macOS 0.2.3）：日志和 `log show --predicate 'process == "bluetoothd"'` 确认了一个可连续 40 分钟的死循环——Mac 能发现手机，HCI 层每次连接都成功，但 3–13 毫秒后就被对端断开（`reason 762`），App 连 `didConnect` 都收不到，15 秒看门狗随后报 `连接手机超时`。根因是 13:48 建立的链路在 Mac 维护性睡眠后仍留在 CoreBluetooth 会话里（`system_profiler` 从 13:48 到 15:47 一直显示手机 Connected），App 却已经丢掉了 `CBPeripheral` 引用；手机端同样保留了这条链路，于是新连接被当作“第二个 central”拒绝。新版：
+  - Mac 在睡眠期间蓝牙断电、或连续两次“服务发现前失败 / 建立后 1 秒内被断开 / 写入超时”时，销毁并重建整个 `CBCentralManager`，用结束会话的方式释放遗留链路（退出 App 之所以能“修好”就是这个原因）；
+  - 手机端把超过 10 秒没有心跳的旧链路判定为遗留链路，主动断开并接受新连接；连接期间若广播仍在运行，看门狗会把它停掉；
+  - 4 字节设备标识前缀直接放进主广播包，不再依赖 macOS 不保证合并的扫描响应（本机日志里 `manufacturer` 长期是 `none`），Mac 按前缀匹配已保存的 8 字节标识。
 - 已生成 macOS DMG/ZIP 和 Android APK，校验和见 `dist/SHA256SUMS.txt`。
 
 尚未验证：
@@ -279,7 +283,7 @@ Mac 菜单里的「状态」会显示当前可用路径，例如「已连接：�
 - iPhone（不支持，见上）。
 - Mac 构建为 Apple Silicon（arm64）版本，未生成 Intel 通用二进制。
 
-> APK 路径：`dist/NotifyBridge-Android-0.2.5-debug.apk`
+> APK 路径：`dist/NotifyBridge-Android-0.2.6-debug.apk`
 >
 > Android 单元测试：`android/app/src/test/java/com/notifybridge/app/FrameCodecTest.kt`、`NotificationMergeTest.kt`
 
@@ -354,6 +358,8 @@ Mac 在夜间多次睡眠/唤醒、蓝牙反复关闭再打开，旧版自动重
 
 - 每 45 秒一对 `Bluetooth is powered off` / `Bluetooth is powered on`，说明 Mac 还在维护性睡眠循环里（`pmset -g log` 对应 `Maintenance Sleep: TCPKeepAlive=active`）。这是系统电源行为，不是配对问题：可以夜间接电源，或执行 `sudo pmset -b powernap 0`、`sudo pmset -b tcpkeepalive 0` 减少唤醒。
 - 出现 `System woke; rebuilding the BLE session` 说明唤醒处理已生效；出现 `BLE session timed out` 说明看门狗在回收挂起的连接，连续出现时优先检查手机端前台服务是否被厂商冻结。
+- 出现 `Rebuilding the CoreBluetooth session: ...` 是 0.2.3 的自动修复：连续两次连接在服务发现前失败（或建立后 1 秒内被断开）时，App 会销毁并重建 CoreBluetooth 会话，把睡眠前遗留、App 已经丢失引用的链路释放掉。0.2.3 之前这种遗留链路只能靠退出 App 解决。
+- 如果日志里反复出现「发现手机 → 连接成功 → 立刻断开 → `连接手机超时`」，同时 `system_profiler SPBluetoothDataType` 里手机一直显示 `Connected`，说明手机端还握着一条收不到心跳的旧链路；升级到 Android 0.2.6 后，手机会在 10 秒无心跳时主动回收它并接受新连接。
 - 状态停在「正在连接…」时，点菜单里的「重置蓝牙连接」即可恢复，不需要退出 App。
 
 ### 为什么键盘、鼠标、触控板能秒连，手机不行？

@@ -93,6 +93,17 @@ do {
         check(NotifyBridgeIdentity.parseDeviceID(fromManufacturerData: data) == deviceID, "identity round-trip")
         check(NotifyBridgeIdentity.shortSuffix(deviceID) == "CDEF", "identity short suffix")
 
+        // The Android main advertising packet only has room for the first four
+        // bytes; macOS must still recognise the phone from that short form.
+        let short = data.prefix(2) + data.dropFirst(2).prefix(4)
+        check(short.count == 6, "short identity data length")
+        check(NotifyBridgeIdentity.parseDeviceID(fromManufacturerData: short) == "01234567", "short identity parses")
+        check(NotifyBridgeIdentity.parseDeviceID(fromManufacturerData: short.dropFirst(2)) == "01234567", "short payload without company ID")
+        check(NotifyBridgeIdentity.matches(deviceID, "01234567"), "short identity matches the saved full identity")
+        check(NotifyBridgeIdentity.matches("01234567", deviceID), "matching is symmetric")
+        check(!NotifyBridgeIdentity.matches(deviceID, "89ABCDEF"), "different identities do not match")
+        check(!NotifyBridgeIdentity.matches(deviceID, ""), "empty identity never matches")
+
         var wrongCompany = data
         wrongCompany[0] = 0x00
         check(NotifyBridgeIdentity.parseDeviceID(fromManufacturerData: wrongCompany) == nil, "wrong company rejected")
@@ -206,6 +217,20 @@ do {
             check(false, "relay AES-GCM encrypt")
         }
     }
+}
+
+do {
+    var policy = SessionRebuildPolicy()
+    let t0 = Date(timeIntervalSince1970: 1_700_000_000)
+    check(!policy.noteStall(at: t0), "one stalled connect does not rebuild the session")
+    check(policy.noteStall(at: t0.addingTimeInterval(2)), "two stalled connects rebuild the session")
+    policy.noteRebuild(at: t0.addingTimeInterval(2))
+    check(policy.consecutiveStalls == 0, "rebuild clears the stall counter")
+    check(!policy.noteStall(at: t0.addingTimeInterval(3)), "a single stall after a rebuild is not enough")
+    check(!policy.noteStall(at: t0.addingTimeInterval(4)), "rebuilds are throttled to one per minute")
+    check(policy.noteStall(at: t0.addingTimeInterval(70)), "rebuild allowed again after the cooldown")
+    policy.noteSuccess()
+    check(policy.consecutiveStalls == 0, "a successful connection clears the stalls")
 }
 
 do {

@@ -85,6 +85,7 @@ class NotificationRelayService : Service() {
     private var sendTimeoutRunnable: Runnable? = null
     private var subscribeTimeoutRunnable: Runnable? = null
     private var advertiseRetryDelayMs = 5_000L
+    @Volatile private var advertiseStableIdInMainPacket = true
     private var networkRelay: NetworkRelayManager? = null
     private var lastListenerConnected: Boolean? = null
 
@@ -268,6 +269,12 @@ class NotificationRelayService : Service() {
                     stopAdvertising()
                     mainHandler.postDelayed({ startAdvertising() }, 300)
                 }
+            } else if (isAdvertising) {
+                // The advertising set survived a connection on some stacks.
+                // That is what let the Mac keep discovering a phone that was
+                // already connected and then watch every new link die.
+                Log.i(TAG, "Advertising is still running while connected; stopping it")
+                stopAdvertising()
             }
             mainHandler.postDelayed(this, ADVERTISING_WATCHDOG_INTERVAL_MS)
         }
@@ -350,6 +357,31 @@ class NotificationRelayService : Service() {
             }
             startAdvertising()
         }, 1_200)
+    }
+
+    /**
+     * Drop a link that stopped answering. Its DISCONNECTED callback arrives
+     * later and is ignored, because connectedDevice already points at the
+     * replacement by then.
+     */
+    private fun retireCentral(device: BluetoothDevice) {
+        stopMacWatchdog()
+        disarmSendTimeout()
+        disarmSubscribeTimeout()
+        isSubscribed = false
+        isPaired = false
+        incomingReassembler.reset()
+        synchronized(outgoingLock) {
+            outgoingQueue.clear()
+            isSending = false
+        }
+        RelayState.centralConnected = false
+        RelayState.paired = false
+        try {
+            gattServer?.cancelConnection(device)
+        } catch (e: Exception) {
+            Log.w(TAG, "Unable to drop the stale central", e)
+        }
     }
 
     private val bluetoothStateReceiver = object : BroadcastReceiver() {
@@ -594,9 +626,19 @@ class NotificationRelayService : Service() {
             .setTimeout(0)
             .build()
 
+        // The main packet carries the first four identity bytes: macOS often
+        // hands CoreBluetooth apps only this packet, not the scan response, and
+        // without a stable ID the Mac cannot recognize the phone after Android
+        // rotates its BLE address. 128-bit UUID (18) + identity (8) + flags (3)
+        // stays within the 31-byte legacy limit.
         val data = AdvertiseData.Builder()
             .addServiceUuid(ParcelUuid(BleProtocol.SERVICE_UUID))
             .setIncludeTxPowerLevel(false)
+            .apply {
+                if (advertiseStableIdInMainPacket) {
+                    addManufacturerData(MANUFACTURER_ID, DeviceIdentity.shortBytes(this@NotificationRelayService))
+                }
+            }
             .build()
 
         val scanResponse = AdvertiseData.Builder()
@@ -681,7 +723,16 @@ class NotificationRelayService : Service() {
                 ADVERTISE_FAILED_INTERNAL_ERROR -> "蓝牙广播内部错误"
                 else -> "启动蓝牙广播失败（$errorCode）"
             }
-            fail(reason)
+            if (errorCode == ADVERTISE_FAILED_DATA_TOO_LARGE && advertiseStableIdInMainPacket) {
+                // Some controllers cannot fit the 128-bit UUID plus the
+                // identity in one legacy packet. Keep working with the old
+                // scan-response-only layout instead of failing forever.
+                advertiseStableIdInMainPacket = false
+                Log.w(TAG, "Main advertisement too large; identity moves to the scan response")
+                fail("蓝牙广播数据过大，设备标识已改到扫描响应")
+            } else {
+                fail(reason)
+            }
             if (errorCode == ADVERTISE_FAILED_ALREADY_STARTED) {
                 // Someone else owns the advertising set; treat it as running and
                 // let the watchdog recycle it instead of retrying in a loop.
@@ -724,17 +775,28 @@ class NotificationRelayService : Service() {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 val existing = connectedDevice
                 if (existing != null && existing != device) {
-                    // A stale central can keep a GATT connection alive while the
-                    // Mac reconnects. Overwriting connectedDevice would make the
-                    // phone silently drop the new Mac's commands (including the
-                    // pairing code), so reject the extra link instead.
-                    Log.w(TAG, "Rejecting a second central while another is connected")
-                    try {
-                        gattServer?.cancelConnection(device)
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Unable to reject the second central", e)
+                    val idleMs = SystemClock.elapsedRealtime() - lastMacContactElapsed
+                    if (!GattLinkPolicy.isStale(idleMs)) {
+                        // A second live central. Overwriting connectedDevice
+                        // would make the phone silently drop the current Mac's
+                        // commands (including the pairing code), so reject the
+                        // extra link instead.
+                        Log.w(TAG, "Rejecting a second central while another is connected (idle ${idleMs}ms)")
+                        try {
+                            gattServer?.cancelConnection(device)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Unable to reject the second central", e)
+                        }
+                        return
                     }
-                    return
+                    // The old link stopped sending heartbeats (Mac slept, the app
+                    // was frozen, the peer vanished) but the controller never
+                    // reported a disconnect. Keeping it rejects every reconnect
+                    // forever, which is exactly the "found the phone but every
+                    // connection dies instantly" loop. Drop it and take the new
+                    // connection. See GattLinkPolicy for the threshold.
+                    Log.w(TAG, "Replacing a stale central (idle ${idleMs}ms) with the new connection")
+                    retireCentral(existing)
                 }
                 connectedDevice = device
                 lastMacContactElapsed = SystemClock.elapsedRealtime()

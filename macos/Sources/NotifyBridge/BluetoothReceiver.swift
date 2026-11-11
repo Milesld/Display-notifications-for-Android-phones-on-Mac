@@ -52,6 +52,17 @@ final class BluetoothReceiver: NSObject {
     private var automaticConnection = false
     private var pinRejected = false
 
+    /// Connection attempts that died before service discovery finished. Two in
+    /// a row (a 15 s watchdog timeout or a link that drops within a second)
+    /// mean this CoreBluetooth session is wedged: macOS can keep a link from
+    /// before the sleep alive without telling the app, and every new connection
+    /// to the same phone is then cancelled by the phone almost instantly.
+    /// Rebuilding the manager is the only way to release that link from here.
+    private var rebuildPolicy = SessionRebuildPolicy()
+    private var managerRebuildInProgress = false
+    private var needsManagerRebuildAfterWake = false
+    private var lastConnectedAt: Date?
+
     private(set) var statusText = "正在初始化蓝牙…"
     private(set) var isPaired = false
     /// nil = unknown (old phone), true/false = phone reported notification access.
@@ -108,12 +119,19 @@ final class BluetoothReceiver: NSObject {
     func start() {
         guard !started else { return }
         started = true
+        managerRebuildInProgress = false
+        needsManagerRebuildAfterWake = false
+        rebuildPolicy = SessionRebuildPolicy()
         savedPin = PairingVault.loadPin()
         knownDeviceID = PairingVault.knownDeviceID
         knownPeripheralUUID = PairingVault.knownPeripheralUUID.flatMap { UUID(uuidString: $0) }
         pinRejected = PairingVault.pinRejected
         registerSystemSleepObservers()
         AppLogger.info("Starting Bluetooth receiver (auto reconnect: \(autoReconnectEnabled), saved pairing: \(savedPin != nil))")
+        createCentralManager()
+    }
+
+    private func createCentralManager() {
         central = CBCentralManager(
             delegate: self,
             queue: .main,
@@ -282,7 +300,7 @@ final class BluetoothReceiver: NSObject {
         }
         if let knownDeviceID, !knownDeviceID.isEmpty {
             if let deviceID {
-                return deviceID == knownDeviceID
+                return NotifyBridgeIdentity.matches(deviceID, knownDeviceID)
             }
             if let knownPeripheralUUID {
                 return peripheral.identifier == knownPeripheralUUID
@@ -386,6 +404,11 @@ final class BluetoothReceiver: NSObject {
     private func resumeAfterWake() {
         guard started else { return }
         AppLogger.info("System woke; rebuilding the BLE session")
+        if needsManagerRebuildAfterWake {
+            needsManagerRebuildAfterWake = false
+            rebuildBluetoothSession(reason: "系统唤醒后释放睡眠前遗留的蓝牙链路")
+            return
+        }
         rescanWorkItem?.cancel()
         rescanWorkItem = nil
         stopConnectionWatchdog()
@@ -414,6 +437,55 @@ final class BluetoothReceiver: NSObject {
         }
     }
 
+    /// Destroy and recreate the CoreBluetooth session. macOS keeps links that
+    /// were created before a system sleep inside bluetoothd even after the app
+    /// has dropped its CBPeripheral reference; the phone keeps its end too, so
+    /// every new connection is cancelled almost immediately. Only tearing the
+    /// manager down releases that stale link, which is why quitting the app
+    /// "fixes" the problem until the next sleep.
+    private func rebuildBluetoothSession(reason: String) {
+        guard started, !managerRebuildInProgress, !isSystemSleeping else { return }
+        managerRebuildInProgress = true
+        rebuildPolicy.noteRebuild()
+        AppLogger.error("Rebuilding the CoreBluetooth session: \(reason)")
+        rescanWorkItem?.cancel()
+        rescanWorkItem = nil
+        stopTimers()
+        if let peripheral {
+            central?.cancelPeripheralConnection(peripheral)
+        }
+        cleanupConnection()
+        central?.delegate = nil
+        central = nil
+        // Drop every CBPeripheral reference too: they can keep the old manager
+        // (and its links) alive even after the property is cleared.
+        discovered.removeAll()
+        discoveredNames.removeAll()
+        discoveredDeviceIDs.removeAll()
+        onDevicesChange?([])
+        consecutiveConnectionFailures = 0
+        reconnectCooldownUntil = nil
+        isRetryAttempt = false
+        pendingRetryPin = nil
+        pendingRetryDeviceID = nil
+        setStatus("蓝牙会话无响应，正在重建连接…")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self else { return }
+            self.managerRebuildInProgress = false
+            guard self.started, !self.isSystemSleeping else { return }
+            AppLogger.info("CoreBluetooth session rebuilt")
+            self.createCentralManager()
+        }
+    }
+
+    /// Record an attempt that never reached service discovery. Two in a row
+    /// rebuild the session, at most once a minute, so a phone that is simply
+    /// out of range cannot cause a rebuild loop.
+    private func registerConnectionStall(_ reason: String) {
+        guard rebuildPolicy.noteStall() else { return }
+        rebuildBluetoothSession(reason: reason)
+    }
+
     // MARK: - Connection watchdog
 
     /// CoreBluetooth never times out connect(_:options:), and service discovery
@@ -431,6 +503,8 @@ final class BluetoothReceiver: NSObject {
             }
             self.cleanupConnection()
             self.consecutiveConnectionFailures += 1
+            self.registerConnectionStall("连接在服务发现前超时")
+            guard self.central != nil else { return }
             let delay = self.backoffDelay()
             self.startCooldown(delay, message: "蓝牙响应超时，\(Int(delay)) 秒后自动重试…")
         }
@@ -465,6 +539,7 @@ final class BluetoothReceiver: NSObject {
         phoneNotificationsEnabled = nil
         manualDisconnectRequested = false
         automaticConnection = false
+        lastConnectedAt = nil
     }
 
     // MARK: - Pairing, heartbeat and writes
@@ -567,6 +642,7 @@ final class BluetoothReceiver: NSObject {
             if let peripheral = self.peripheral {
                 self.central?.cancelPeripheralConnection(peripheral)
             }
+            self.registerConnectionStall("蓝牙写入超时")
         }
         RunLoop.main.add(timer, forMode: .common)
         writeTimeoutTimer = timer
@@ -654,6 +730,13 @@ extension BluetoothReceiver: CBCentralManagerDelegate {
             if started { scan() }
         case .poweredOff:
             if peripheral != nil {
+                if isSystemSleeping {
+                    // The controller was powered down with a live link. The
+                    // daemon can keep that link across the nap, so plan a full
+                    // session rebuild for the wake path instead of just
+                    // forgetting the peripheral.
+                    needsManagerRebuildAfterWake = true
+                }
                 cleanupConnection()
             }
             if isSystemSleeping {
@@ -694,7 +777,10 @@ extension BluetoothReceiver: CBCentralManagerDelegate {
         let advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
 
         if let deviceID,
-           let existingIndex = discovered.firstIndex(where: { discoveredDeviceIDs[$0.identifier] == deviceID }) {
+           let existingIndex = discovered.firstIndex(where: {
+               guard let known = discoveredDeviceIDs[$0.identifier] else { return false }
+               return NotifyBridgeIdentity.matches(known, deviceID)
+           }) {
             if discovered[existingIndex].identifier == peripheral.identifier {
                 return
             }
@@ -758,6 +844,8 @@ extension BluetoothReceiver: CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         AppLogger.info("Connected to peripheral")
+        lastConnectedAt = Date()
+        rebuildPolicy.noteSuccess()
         isRetryAttempt = false
         pendingRetryPin = nil
         pendingRetryDeviceID = nil
@@ -804,6 +892,8 @@ extension BluetoothReceiver: CBCentralManagerDelegate {
             return
         }
 
+        registerConnectionStall("连接失败：\(description)")
+        guard self.central != nil else { return }
         let delay = backoffDelay()
         startCooldown(delay, message: "连接失败，\(Int(delay)) 秒后自动重试…")
     }
@@ -813,6 +903,7 @@ extension BluetoothReceiver: CBCentralManagerDelegate {
         didDisconnectPeripheral peripheral: CBPeripheral,
         error: Error?
     ) {
+        let lifetime = lastConnectedAt.map { Date().timeIntervalSince($0) }
         if let error {
             AppLogger.error("Peripheral disconnected: \(error.localizedDescription)")
         } else {
@@ -829,6 +920,12 @@ extension BluetoothReceiver: CBCentralManagerDelegate {
             setStatus("手机已断开，正在等待自动重连…")
         } else {
             setStatus("手机已断开，正在重新搜索…")
+        }
+        if !wasManual, let lifetime, lifetime < 2.0 {
+            // The phone dropped the link before service discovery could run:
+            // a stale link owned by this session is the usual culprit.
+            registerConnectionStall("连接建立 \(Int(lifetime * 1000)) 毫秒后即被断开")
+            guard self.central != nil else { return }
         }
         scheduleRescan()
     }
