@@ -21,6 +21,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var forgetMenuItem: NSMenuItem!
     private var permissionMenuItem: NSMenuItem!
     private var testMenuItem: NSMenuItem!
+    private var autoLockMenuItem: NSMenuItem!
+    private var autoLockDelayMenuItem: NSMenuItem!
+    private var cancelAutoLockMenuItem: NSMenuItem!
+    private var testAutoLockMenuItem: NSMenuItem!
+
+    private lazy var autoLock = AutoLockController(presenter: presenter)
 
     private var devices: [String] = []
     private var statusText = "正在启动…"
@@ -32,7 +38,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppLogger.info("NotifyBridge launched")
         configureStatusItem()
 
+        autoLock.onStateChange = { [weak self] in
+            self?.refreshMenu()
+        }
+        presenter.onAutoLockCancel = { [weak self] in
+            self?.autoLock.cancel(reason: "用户点击取消锁屏")
+        }
+
         presenter.configure()
+        presenter.clearAutoLockWarning()
         presenter.onAuthorizationChange = { [weak self] granted in
             guard let self else { return }
             self.notificationAllowed = granted
@@ -66,6 +80,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         receiver.onMessage = { [weak self] message in
             self?.handleIncoming(message)
         }
+        receiver.onProximityLoss = { [weak self] loss in
+            self?.autoLock.handleLinkLoss(loss)
+        }
+        receiver.onLinkRestored = { [weak self] in
+            self?.autoLock.handleLinkRestored()
+        }
+        receiver.onAutoLockSuppressed = { [weak self] reason in
+            self?.autoLock.cancel(reason: reason)
+        }
         directReceiver.onMessage = { [weak self] message in
             self?.handleIncoming(message)
         }
@@ -90,6 +113,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        autoLock.cancel(reason: "应用退出")
+        presenter.clearAutoLockWarning()
         receiver.stop()
         directReceiver.stop()
         cloudReceiver.stop()
@@ -174,6 +199,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         autoReconnectMenuItem.target = self
         menu.addItem(autoReconnectMenuItem)
 
+        autoLockMenuItem = NSMenuItem(
+            title: "手机离开后自动锁屏",
+            action: #selector(toggleAutoLock),
+            keyEquivalent: ""
+        )
+        autoLockMenuItem.target = self
+        autoLockMenuItem.toolTip = "仅在手机已配对、自动重连开启且断开前 RSSI 很弱时触发；手机 App 被杀或蓝牙关闭不会锁屏。"
+        menu.addItem(autoLockMenuItem)
+
+        autoLockDelayMenuItem = NSMenuItem(
+            title: "自动锁屏延迟",
+            action: nil,
+            keyEquivalent: ""
+        )
+        let delayMenu = NSMenu()
+        delayMenu.autoenablesItems = false
+        for seconds in AutoLockSettings.availableDelays {
+            let item = NSMenuItem(
+                title: AutoLockSettings.delayLabel(seconds),
+                action: #selector(selectAutoLockDelay(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.tag = Int(seconds)
+            delayMenu.addItem(item)
+        }
+        autoLockDelayMenuItem.submenu = delayMenu
+        menu.addItem(autoLockDelayMenuItem)
+
+        cancelAutoLockMenuItem = NSMenuItem(
+            title: "取消等待中的锁屏",
+            action: #selector(cancelPendingAutoLock),
+            keyEquivalent: ""
+        )
+        cancelAutoLockMenuItem.target = self
+        menu.addItem(cancelAutoLockMenuItem)
+
+        testAutoLockMenuItem = NSMenuItem(
+            title: "测试锁屏…",
+            action: #selector(testAutoLock),
+            keyEquivalent: ""
+        )
+        testAutoLockMenuItem.target = self
+        menu.addItem(testAutoLockMenuItem)
+        menu.addItem(.separator())
+
         forgetMenuItem = NSMenuItem(
             title: "忘记已配对手机…",
             action: #selector(confirmForgetPairing),
@@ -238,7 +309,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refreshMenu() {
         guard let statusMenuItem else { return }
 
-        let overall = overallStatus()
+        let overall = autoLock.isPending
+            ? (autoLock.pendingStatus ?? "手机已离开，准备锁屏…")
+            : overallStatus()
         statusMenuItem.title = "状态：\(overall)"
         statusItem.button?.toolTip = "通知桥：\(overall)"
         networkStatusMenuItem.title = "\(directStatus) · \(cloudStatus)"
@@ -264,6 +337,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         autoReconnectMenuItem.state = receiver.autoReconnectEnabled ? .on : .off
         autoReconnectMenuItem.title = "自动重连"
         autoReconnectMenuItem.isEnabled = true
+
+        autoLockMenuItem.state = AutoLockSettings.enabled ? .on : .off
+        autoLockMenuItem.title = receiver.autoReconnectEnabled
+            ? "手机离开后自动锁屏"
+            : "手机离开后自动锁屏（需自动重连）"
+        // Keep the checkbox usable even when auto reconnect is off, so the
+        // user can turn the feature back off; the title explains why it will
+        // not fire in that state.
+        autoLockMenuItem.isEnabled = true
+        autoLockDelayMenuItem.title = "自动锁屏延迟（\(AutoLockSettings.delayLabel(AutoLockSettings.delay))）"
+        autoLockDelayMenuItem.isEnabled = AutoLockSettings.enabled
+        for item in autoLockDelayMenuItem.submenu?.items ?? [] {
+            item.state = item.tag == Int(AutoLockSettings.delay) ? .on : .off
+        }
+        cancelAutoLockMenuItem.isEnabled = autoLock.isPending
+        testAutoLockMenuItem.isEnabled = true
+
         forgetMenuItem.isEnabled = receiver.hasSavedPairing
         reconnectNetworkMenuItem.isEnabled = NetworkSettings.directEnabled || NetworkSettings.cloudEnabled
 
@@ -324,7 +414,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func toggleAutoReconnect() {
         receiver.autoReconnectEnabled.toggle()
+        if !receiver.autoReconnectEnabled {
+            autoLock.cancel(reason: "自动重连已关闭")
+        }
         refreshMenu()
+    }
+
+    @objc private func toggleAutoLock() {
+        if !AutoLockSettings.enabled {
+            let waitText = AutoLockSettings.delay <= 0
+                ? "当前设置为断开后立即锁屏。"
+                : "当前设置为断开后等待 \(Int(AutoLockSettings.delay)) 秒，期间重连就取消。"
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "启用手机离开后自动锁屏？"
+            alert.informativeText = """
+            只在已配对手机离开蓝牙范围、断开前信号已经很弱时才会锁屏。\(waitText)
+
+            手机 App 被杀、手机关闭蓝牙、手机没电、Mac 睡眠、手动断开或信号抖动都不会触发。锁屏后需要输入密码或使用 Touch ID 解锁。
+            """
+            alert.addButton(withTitle: "启用")
+            alert.addButton(withTitle: "取消")
+            NSApp.activate(ignoringOtherApps: true)
+            guard alert.runModal() == .alertFirstButtonReturn else {
+                refreshMenu()
+                return
+            }
+        }
+
+        AutoLockSettings.enabled.toggle()
+        if !AutoLockSettings.enabled {
+            autoLock.cancel(reason: "用户关闭自动锁屏")
+        }
+        autoLock.settingsDidChange()
+        AppLogger.info("Auto-lock setting changed to \(AutoLockSettings.enabled)")
+        refreshMenu()
+    }
+
+    @objc private func selectAutoLockDelay(_ sender: NSMenuItem) {
+        let delay = TimeInterval(sender.tag)
+        guard AutoLockSettings.availableDelays.contains(delay) else { return }
+        AutoLockSettings.delay = delay
+        autoLock.delayDidChange()
+        AppLogger.info("Auto-lock delay changed to \(AutoLockSettings.delayLabel(delay))")
+        refreshMenu()
+    }
+
+    @objc private func cancelPendingAutoLock() {
+        autoLock.cancel(reason: "用户手动取消")
+        refreshMenu()
+    }
+
+    @objc private func testAutoLock() {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "测试锁屏？"
+        alert.informativeText = "这会立即锁定屏幕，需要密码或 Touch ID 解锁。测试只验证锁屏调用，不会改变自动锁屏开关。"
+        alert.addButton(withTitle: "立即锁屏")
+        alert.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let result = autoLock.lockNowForTesting()
+        if case .failed(let reason) = result {
+            showAlert(title: "锁屏失败", message: reason)
+        }
     }
 
     @objc private func confirmForgetPairing() {
@@ -487,6 +641,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         • 手机 tailnet 地址在 Tailscale 管理后台 → Machines → 手机详情里查看；Mac 终端也可用 tailscale status。填地址时要加 :47821。
         • 手动点「断开连接」只暂停蓝牙；网络通道仍会保持。
         • 「忘记已配对手机」会删除保存的配对信息，网络直连也会停止。
+
+        手机离开后自动锁屏（可选）：
+        • 菜单勾选「手机离开后自动锁屏」，默认关闭，默认延迟 10 秒。
+        • 只有已配对链路、断开前 RSSI 低于 -80 dBm，且延迟内没有重连时才锁屏。手机 App 被杀、蓝牙关闭、Mac 睡眠、手动断开不会触发。
+        • 锁屏只调用屏幕锁定接口：优先 loginwindow 的 SACLockScreenImmediate，旧系统回退 CGSession -suspend。不会用系统睡眠或显示器睡眠代替；两者都不可用时直接报告锁屏失败。
+        • 锁屏后 Mac 仍在运行；显示器可能按系统空闲设置熄灭，那是显示器睡眠，不是系统睡眠。
+        • BLE 无法分辨是手机离开还是你带着 Mac 离开手机。锁屏前会发带「取消锁屏」按钮的通知，菜单里也能取消。
 
         通知只有通知中心、没有横幅？
         • 先确认系统设置 → 通知 → 通知桥 的样式是「横幅」或「提醒」。

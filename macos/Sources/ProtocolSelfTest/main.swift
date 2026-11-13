@@ -240,6 +240,37 @@ do {
     check(RelayTarget.parse("", defaultPort: 443) == nil, "target empty")
 }
 
+do {
+    func loss(
+        rssi: Int? = -85,
+        age: TimeInterval = 2,
+        paired: Bool = true,
+        autoReconnect: Bool = true,
+        session: TimeInterval = 60
+    ) -> AutoLockLinkLoss {
+        AutoLockLinkLoss(
+            lastRSSI: rssi,
+            rssiAge: age,
+            wasPaired: paired,
+            autoReconnectActive: autoReconnect,
+            sessionDuration: session
+        )
+    }
+
+    check(AutoLockPolicy.decide(loss()) == .arm, "weak RSSI arms auto-lock")
+    check(AutoLockPolicy.decide(loss(rssi: -80)) == .arm, "RSSI threshold is inclusive")
+    check(AutoLockPolicy.decide(loss(rssi: -79)) == .rssiTooStrong, "strong RSSI skips auto-lock")
+    check(AutoLockPolicy.decide(loss(rssi: nil)) == .rssiUnavailable, "missing RSSI skips auto-lock")
+    check(AutoLockPolicy.decide(loss(rssi: 127)) == .rssiUnavailable, "unknown RSSI skips auto-lock")
+    check(AutoLockPolicy.decide(loss(age: 13)) == .rssiUnavailable, "stale RSSI skips auto-lock")
+    check(AutoLockPolicy.decide(loss(age: -1)) == .rssiUnavailable, "negative RSSI age skips auto-lock")
+    check(AutoLockPolicy.decide(loss(session: 2)) == .sessionTooShort, "short session skips auto-lock")
+    check(AutoLockPolicy.decide(loss(session: 3)) == .arm, "minimum session arms auto-lock")
+    check(AutoLockPolicy.decide(loss(paired: false)) == .notPaired, "unpaired link skips auto-lock")
+    check(AutoLockPolicy.decide(loss(autoReconnect: false)) == .autoReconnectOff, "disabled auto reconnect skips auto-lock")
+    check(!AutoLockPolicy.decide(loss(rssi: -70)).shouldArm, "non-arm decisions are reported as such")
+}
+
 if failures == 0 {
     print("All protocol self-tests passed.")
     exit(0)

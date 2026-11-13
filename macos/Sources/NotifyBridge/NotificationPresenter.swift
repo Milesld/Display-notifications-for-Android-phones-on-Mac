@@ -3,9 +3,16 @@ import UserNotifications
 import NotifyBridgeCore
 
 final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
+    static let autoLockCategoryIdentifier = "NotifyBridge.AutoLock"
+    static let autoLockCancelActionIdentifier = "NotifyBridge.AutoLock.Cancel"
+    private static let autoLockNotificationIdentifier = "notifybridge.autolock.warning"
+
     private(set) var authorizationGranted = false
     private(set) var permissionSummary = "通知权限：检查中…"
     var onAuthorizationChange: ((Bool) -> Void)?
+    /// The auto-lock warning's "取消锁屏" action (or a normal click) cancels
+    /// the pending timer. The AppDelegate connects this to AutoLockController.
+    var onAutoLockCancel: (() -> Void)?
 
     private let deliveryLock = NSLock()
     private var recentDeliveries: [String: Date] = [:]
@@ -16,7 +23,20 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
     private var deliveredKeys: [String: Date] = [:]
 
     func configure() {
-        UNUserNotificationCenter.current().delegate = self
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        let cancel = UNNotificationAction(
+            identifier: Self.autoLockCancelActionIdentifier,
+            title: "取消锁屏",
+            options: []
+        )
+        let category = UNNotificationCategory(
+            identifier: Self.autoLockCategoryIdentifier,
+            actions: [cancel],
+            intentIdentifiers: [],
+            options: []
+        )
+        center.setNotificationCategories([category])
         refreshAuthorization()
     }
 
@@ -111,6 +131,44 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
         deliver(message)
     }
 
+    /// Shows the countdown warning before the screen locks. The action button
+    /// cancels the pending lock; the controller also removes it on reconnect.
+    func showAutoLockWarning(seconds: Int) {
+        guard seconds > 0 else { return }
+        guard authorizationGranted else {
+            AppLogger.error("Auto-lock warning not shown because notifications are not authorized")
+            return
+        }
+
+        let content = UNMutableNotificationContent()
+        content.title = "手机已离开蓝牙范围"
+        content.body = "约 \(seconds) 秒后锁定 Mac。如果你还在电脑前，请点「取消锁屏」。"
+        content.sound = .default
+        content.categoryIdentifier = Self.autoLockCategoryIdentifier
+        content.threadIdentifier = "notifybridge.autolock"
+        content.userInfo = ["source": "notifybridge.autolock"]
+
+        let center = UNUserNotificationCenter.current()
+        center.removePendingNotificationRequests(withIdentifiers: [Self.autoLockNotificationIdentifier])
+        center.removeDeliveredNotifications(withIdentifiers: [Self.autoLockNotificationIdentifier])
+        let request = UNNotificationRequest(
+            identifier: Self.autoLockNotificationIdentifier,
+            content: content,
+            trigger: nil
+        )
+        center.add(request) { error in
+            if let error {
+                AppLogger.error("Unable to deliver auto-lock warning: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    func clearAutoLockWarning() {
+        let center = UNUserNotificationCenter.current()
+        center.removePendingNotificationRequests(withIdentifiers: [Self.autoLockNotificationIdentifier])
+        center.removeDeliveredNotifications(withIdentifiers: [Self.autoLockNotificationIdentifier])
+    }
+
     private func apply(_ settings: UNNotificationSettings) {
         let granted = settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional
         let alertsEnabled = settings.alertSetting == .enabled
@@ -201,6 +259,15 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
+        if response.notification.request.content.categoryIdentifier == Self.autoLockCategoryIdentifier {
+            let action = response.actionIdentifier
+            if action == Self.autoLockCancelActionIdentifier
+                || action == UNNotificationDefaultActionIdentifier {
+                DispatchQueue.main.async { [weak self] in
+                    self?.onAutoLockCancel?()
+                }
+            }
+        }
         completionHandler()
     }
 }

@@ -13,6 +13,15 @@ final class BluetoothReceiver: NSObject {
     var onStatusChange: ((String) -> Void)?
     var onDevicesChange: (([String]) -> Void)?
     var onMessage: ((WireMessage) -> Void)?
+    /// A trusted, paired link was lost without a manual disconnect, sleep or
+    /// Bluetooth power event. The controller decides whether it was a range
+    /// loss by looking at the RSSI sample captured just before the drop.
+    var onProximityLoss: ((AutoLockLinkLoss) -> Void)?
+    /// A new BLE connection was established; any pending auto-lock is stale.
+    var onLinkRestored: (() -> Void)?
+    /// A manual disconnect, session reset, sleep, or Bluetooth power change
+    /// happened; cancel any pending auto-lock without treating it as a loss.
+    var onAutoLockSuppressed: ((String) -> Void)?
 
     private var central: CBCentralManager?
     private var peripheral: CBPeripheral?
@@ -46,6 +55,10 @@ final class BluetoothReceiver: NSObject {
     private var heartbeatTimer: Timer?
     private var writeTimeoutTimer: Timer?
     private var connectionWatchdog: Timer?
+    private var rssiTimer: Timer?
+    private var lastRSSI: Int?
+    private var lastRSSIAt: Date?
+    private var autoLockSuppressed = false
     private var heartbeatActivity: NSObjectProtocol?
     private var wakeObservers: [NSObjectProtocol] = []
     private var isSystemSleeping = false
@@ -126,6 +139,7 @@ final class BluetoothReceiver: NSObject {
         knownDeviceID = PairingVault.knownDeviceID
         knownPeripheralUUID = PairingVault.knownPeripheralUUID.flatMap { UUID(uuidString: $0) }
         pinRejected = PairingVault.pinRejected
+        autoLockSuppressed = false
         registerSystemSleepObservers()
         AppLogger.info("Starting Bluetooth receiver (auto reconnect: \(autoReconnectEnabled), saved pairing: \(savedPin != nil))")
         createCentralManager()
@@ -141,6 +155,7 @@ final class BluetoothReceiver: NSObject {
 
     func stop() {
         started = false
+        onAutoLockSuppressed?("应用停止蓝牙接收")
         rescanWorkItem?.cancel()
         rescanWorkItem = nil
         unregisterSystemSleepObservers()
@@ -222,6 +237,7 @@ final class BluetoothReceiver: NSObject {
     }
 
     func disconnect() {
+        onAutoLockSuppressed?("手动断开连接")
         autoReconnectSuspended = true
         manualDisconnectRequested = true
         pendingRetryPin = nil
@@ -239,6 +255,8 @@ final class BluetoothReceiver: NSObject {
     /// forget the backoff and scan again without relaunching the app.
     func resetBluetoothSession() {
         guard started else { return }
+        autoLockSuppressed = true
+        onAutoLockSuppressed?("重置蓝牙连接")
         AppLogger.info("Manual BLE session reset")
         rescanWorkItem?.cancel()
         rescanWorkItem = nil
@@ -258,6 +276,8 @@ final class BluetoothReceiver: NSObject {
 
     func forgetPairing() {
         PairingVault.forget()
+        autoLockSuppressed = true
+        onAutoLockSuppressed?("忘记配对")
         savedPin = nil
         knownDeviceID = nil
         knownPeripheralUUID = nil
@@ -313,6 +333,8 @@ final class BluetoothReceiver: NSObject {
 
     private func connect(to target: CBPeripheral, pin: String, automatic: Bool) {
         guard peripheral == nil else { return }
+        lastRSSI = nil
+        lastRSSIAt = nil
         activePin = pin
         activeDeviceID = discoveredDeviceIDs[target.identifier]
         automaticConnection = automatic
@@ -378,6 +400,7 @@ final class BluetoothReceiver: NSObject {
         ) { [weak self] _ in
             guard let self else { return }
             self.isSystemSleeping = true
+            self.onAutoLockSuppressed?("系统睡眠")
             AppLogger.info("System is going to sleep; BLE session will be rebuilt on wake")
         })
         wakeObservers.append(center.addObserver(
@@ -387,6 +410,7 @@ final class BluetoothReceiver: NSObject {
         ) { [weak self] _ in
             guard let self else { return }
             self.isSystemSleeping = false
+            self.onAutoLockSuppressed?("系统唤醒")
             self.resumeAfterWake()
         })
     }
@@ -445,6 +469,8 @@ final class BluetoothReceiver: NSObject {
     /// "fixes" the problem until the next sleep.
     private func rebuildBluetoothSession(reason: String) {
         guard started, !managerRebuildInProgress, !isSystemSleeping else { return }
+        autoLockSuppressed = true
+        onAutoLockSuppressed?("重建蓝牙会话")
         managerRebuildInProgress = true
         rebuildPolicy.noteRebuild()
         AppLogger.error("Rebuilding the CoreBluetooth session: \(reason)")
@@ -540,6 +566,8 @@ final class BluetoothReceiver: NSObject {
         manualDisconnectRequested = false
         automaticConnection = false
         lastConnectedAt = nil
+        lastRSSI = nil
+        lastRSSIAt = nil
     }
 
     // MARK: - Pairing, heartbeat and writes
@@ -593,8 +621,37 @@ final class BluetoothReceiver: NSObject {
     private func stopTimers() {
         stopHeartbeat()
         stopConnectionWatchdog()
+        stopRSSISampling()
         writeTimeoutTimer?.invalidate()
         writeTimeoutTimer = nil
+    }
+
+    // MARK: - RSSI sampling
+
+    /// CoreBluetooth only reports RSSI while scanning unless the central asks
+    /// for it explicitly. Sample every two seconds while connected so the
+    /// disconnect handler has a recent proximity reading. The value is used
+    /// only for the conservative auto-lock decision, never for reconnect.
+    private func startRSSISampling() {
+        stopRSSISampling()
+        lastRSSI = nil
+        lastRSSIAt = nil
+        readRSSI()
+        let timer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.readRSSI()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        rssiTimer = timer
+    }
+
+    private func stopRSSISampling() {
+        rssiTimer?.invalidate()
+        rssiTimer = nil
+    }
+
+    private func readRSSI() {
+        guard let peripheral, peripheral.state == .connected else { return }
+        peripheral.readRSSI()
     }
 
     private func sendPing() {
@@ -724,6 +781,11 @@ final class BluetoothReceiver: NSObject {
 
 extension BluetoothReceiver: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        if central.state != .poweredOn {
+            // Sleep, a user toggling Bluetooth, or the controller resetting
+            // must not look like a proximity loss.
+            onAutoLockSuppressed?("蓝牙状态变化（\(central.state.rawValue)）")
+        }
         switch central.state {
         case .poweredOn:
             AppLogger.info("Bluetooth is powered on")
@@ -845,6 +907,8 @@ extension BluetoothReceiver: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         AppLogger.info("Connected to peripheral")
         lastConnectedAt = Date()
+        autoLockSuppressed = false
+        onLinkRestored?()
         rebuildPolicy.noteSuccess()
         isRetryAttempt = false
         pendingRetryPin = nil
@@ -852,6 +916,7 @@ extension BluetoothReceiver: CBCentralManagerDelegate {
         consecutiveConnectionFailures = 0
         reconnectCooldownUntil = nil
         peripheral.delegate = self
+        startRSSISampling()
         setStatus("已连接，正在发现服务…")
         armConnectionWatchdog(15, reason: "服务发现超时")
         peripheral.discoverServices([CBUUID(string: NotifyBridgeProtocol.serviceUUID)])
@@ -903,24 +968,58 @@ extension BluetoothReceiver: CBCentralManagerDelegate {
         didDisconnectPeripheral peripheral: CBPeripheral,
         error: Error?
     ) {
-        let lifetime = lastConnectedAt.map { Date().timeIntervalSince($0) }
+        guard peripheral === self.peripheral else {
+            AppLogger.info("Ignoring disconnect callback for a stale peripheral")
+            return
+        }
+        let now = Date()
+        let lifetime = lastConnectedAt.map { now.timeIntervalSince($0) }
+        let wasManual = manualDisconnectRequested
+        let wasPaired = isPaired
+        let wasAutoReconnectActive = autoReconnectActive
+        let wasSleeping = isSystemSleeping
+        let wasPoweredOn = central.state == .poweredOn
+        let wasRebuilding = managerRebuildInProgress
+        let wasSuppressed = autoLockSuppressed
+        let disconnectRSSI = lastRSSI
+        let rssiAge = lastRSSIAt.map { now.timeIntervalSince($0) } ?? .infinity
+
         if let error {
             AppLogger.error("Peripheral disconnected: \(error.localizedDescription)")
         } else {
             AppLogger.info("Peripheral disconnected")
         }
-        let wasManual = manualDisconnectRequested
         cleanupConnection()
         isRetryAttempt = false
         if wasManual {
             pendingRetryPin = nil
             pendingRetryDeviceID = nil
             setStatus("已断开，点击「连接手机」可重连")
-        } else if autoReconnectActive {
+        } else if wasAutoReconnectActive {
             setStatus("手机已断开，正在等待自动重连…")
         } else {
             setStatus("手机已断开，正在重新搜索…")
         }
+
+        var suppressionReasons: [String] = []
+        if wasManual { suppressionReasons.append("手动断开") }
+        if wasSleeping { suppressionReasons.append("系统睡眠") }
+        if !wasPoweredOn { suppressionReasons.append("蓝牙不可用（\(central.state.rawValue)）") }
+        if wasRebuilding { suppressionReasons.append("正在重建蓝牙会话") }
+        if wasSuppressed { suppressionReasons.append("此前已抑制自动锁屏") }
+
+        if suppressionReasons.isEmpty {
+            onProximityLoss?(AutoLockLinkLoss(
+                lastRSSI: disconnectRSSI,
+                rssiAge: rssiAge,
+                wasPaired: wasPaired,
+                autoReconnectActive: wasAutoReconnectActive,
+                sessionDuration: lifetime ?? 0
+            ))
+        } else {
+            onAutoLockSuppressed?(suppressionReasons.joined(separator: "、"))
+        }
+
         if !wasManual, let lifetime, lifetime < 2.0 {
             // The phone dropped the link before service discovery could run:
             // a stale link owned by this session is the usual culprit.
@@ -1053,6 +1152,16 @@ extension BluetoothReceiver: CBPeripheralDelegate {
             return
         }
         writeNextFrame()
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
+        guard peripheral === self.peripheral, error == nil else { return }
+        let value = RSSI.intValue
+        // CoreBluetooth uses 127 for "unknown". Do not turn that into a
+        // misleadingly strong proximity reading.
+        guard value < 0 else { return }
+        lastRSSI = value
+        lastRSSIAt = Date()
     }
 
     private func failAndDisconnect(_ reason: String) {
