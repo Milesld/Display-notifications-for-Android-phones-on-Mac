@@ -1,3 +1,3 @@
-cede1777074adaf80f8f7feb605296ed3f1d620ce7c1bc1f6767998ef2e3223a  NotifyBridge-macOS-0.2.3.dmg
-db82a07bf636bcab203c7fa610d2b6f865c38298f3b5b7faa29a535e377672de  NotifyBridge-macOS-0.2.3.zip
+3bf2aa4f56ddc4853e9589eb7aa5f1be780cc1206a0a49d72dd91cf1bdd12973  NotifyBridge-macOS-0.2.4.dmg
+6ebd4e9e1fdda57954a85a55807ed2347a95631ab4b51ee18d23cd4527f3eef2  NotifyBridge-macOS-0.2.4.zip
 43bbd6e3d8cbfdad21c659f343dbdc1578ad24c13c33ceb2415d24cc22ab753f  NotifyBridge-Android-0.2.6-debug.apk

@@ -137,12 +137,10 @@ NotificationHub
 构建产物通过 GitHub Releases 发布，二进制不进 Git（`dist/` 只保留 `SHA256SUMS.txt`）：
 
 - 最新发布：<https://github.com/Milesld/Display-notifications-for-Android-phones-on-Mac/releases/latest>
-- `NotifyBridge-macOS-0.2.3.dmg`：Mac 安装包（Apple Silicon；含睡眠后遗留链路自愈）。
-- `NotifyBridge-macOS-0.2.3.zip`：同样的 `.app` 压缩包。
+- `NotifyBridge-macOS-0.2.4.dmg`：Mac 安装包（Apple Silicon；新增手机离开后自动锁屏，含睡眠后遗留链路自愈）。
+- `NotifyBridge-macOS-0.2.4.zip`：同样的 `.app` 压缩包。
 - `NotifyBridge-Android-0.2.6-debug.apk`：可直接安装的 Android debug 包（含遗留链路回收与主广播设备标识）。
 - `SHA256SUMS.txt`：三个产物的校验和。
-
-> 源码中的 macOS 0.2.4（自动锁屏）已经可以通过 `./scripts/build-macos.sh` 构建到 `dist/NotifyBridge.app`；上面的 DMG/ZIP 仍是上一版 0.2.3 发布产物。
 
 Mac 端没有经过 Apple 公证（ad-hoc 签名），首次打开如果被 Gatekeeper 拦住，右键 App →「打开」。Android 包使用 debug 签名，适合自用测试，不适合上架。
 
