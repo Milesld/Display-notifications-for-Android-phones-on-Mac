@@ -27,6 +27,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var testAutoLockMenuItem: NSMenuItem!
 
     private lazy var autoLock = AutoLockController(presenter: presenter)
+    private lazy var notificationRulesWindow = NotificationRulesWindowController()
 
     private var devices: [String] = []
     private var statusText = "正在启动…"
@@ -269,6 +270,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         networkSettingsMenuItem.target = self
         menu.addItem(networkSettingsMenuItem)
         menu.addItem(.separator())
+
+        let notificationRulesItem = NSMenuItem(
+            title: "按 App 设置通知…",
+            action: #selector(showNotificationRules),
+            keyEquivalent: ""
+        )
+        notificationRulesItem.target = self
+        menu.addItem(notificationRulesItem)
 
         testMenuItem = NSMenuItem(
             title: "发送测试通知",
@@ -588,6 +597,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshMenu()
     }
 
+    @objc private func showNotificationRules() {
+        notificationRulesWindow.present()
+    }
+
     @objc private func sendTestNotification() {
         presenter.refreshAuthorization()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
@@ -653,6 +666,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         • 先确认系统设置 → 通知 → 通知桥 的样式是「横幅」或「提醒」。
         • 如果权限已经开启仍然没有横幅，检查控制中心是否启用了「专注模式/勿扰模式」。专注模式会把横幅延迟，只放进通知中心；可以把通知桥加入该专注模式的允许通知，或暂时关闭专注模式。
         • 微信、短信等能否显示具体内容，取决于手机通知本身是否包含内容。
+
+        按 App 设置弹窗或静默：
+        • 菜单「按 App 设置通知…」会列出收到过通知的 App，默认全部弹窗。
+        • 把某个 App 改成「静默」后，它的通知仍然进入通知中心，但不弹横幅、不响铃；规则只影响之后收到的通知。
+        • 静默只改变 Mac 端的显示方式，不会修改或屏蔽手机上的通知。
+        • 专注模式下仍建议把通知桥加入允许通知：设为弹窗的 App 才能打断专注，设为静默的 App 不会。
 
         说明：
         • 仅支持 Android。iPhone 没有向第三方 App 开放读取系统通知的接口。

@@ -8,6 +8,8 @@
 
 0.2.4 起还新增了可选的「手机离开后自动锁屏」：默认关闭，只有断开前信号很弱且宽限期内没有重连时才触发。
 
+0.2.5 起支持按手机 App 分流：重要的 App 弹横幅，其余只进通知中心，适合在专注模式下只放行少数 App。
+
 ---
 
 ## 先说结论：iPhone 能不能做？
@@ -63,7 +65,8 @@
 ## 它长什么样
 
 - **Android 端**：打开通知访问 → 启动同步 → 显示 6 位配对码；前台服务同时保持 BLE 广播、TCP 服务（47821）和可选的云中转连接。
-- **Mac 端**：菜单栏图标 → 首次输入配对码；之后新通知以 macOS 横幅显示。蓝牙、局域网、Tailscale 与云中转会同时尝试，断线后自动重连；可选「手机离开后自动锁屏」。
+- **Mac 端**：菜单栏图标 → 首次输入配对码；之后新通知以 macOS 横幅显示。蓝牙、局域网、Tailscale 与云中转会同时尝试，断线后自动重连；可选「手机离开后自动锁屏」、按 App 设置弹窗或静默。
+- **按 App 分流**：菜单栏「按 App 设置通知…」可以让部分 App 弹横幅、其余只进通知中心；按 Android 包名匹配，升级后收到过通知的 App 会自动出现。
 - **网络设置**：手机和 Mac 都有「网络与中继设置…」，用于配置 Tailscale 地址、云中转地址与端到端密钥。
 - 不显示 Dock 图标（`LSUIElement`），只占菜单栏。
 - 通知内容格式：标题为发件人/会话，副标题为 App 名称，正文为消息内容。
@@ -137,8 +140,8 @@ NotificationHub
 构建产物通过 GitHub Releases 发布，二进制不进 Git（`dist/` 只保留 `SHA256SUMS.txt`）：
 
 - 最新发布：<https://github.com/Milesld/Display-notifications-for-Android-phones-on-Mac/releases/latest>
-- `NotifyBridge-macOS-0.2.4.dmg`：Mac 安装包（Apple Silicon；新增手机离开后自动锁屏，含睡眠后遗留链路自愈）。
-- `NotifyBridge-macOS-0.2.4.zip`：同样的 `.app` 压缩包。
+- `NotifyBridge-macOS-0.2.5.dmg`：Mac 安装包（Apple Silicon；新增按手机 App 设置弹窗/静默，含自动锁屏与睡眠后遗留链路自愈）。
+- `NotifyBridge-macOS-0.2.5.zip`：同样的 `.app` 压缩包。
 - `NotifyBridge-Android-0.2.6-debug.apk`：可直接安装的 Android debug 包（含遗留链路回收与主广播设备标识）。
 - `SHA256SUMS.txt`：三个产物的校验和。
 
@@ -249,6 +252,19 @@ Mac 菜单里的「状态」会显示当前可用路径，例如「已连接：�
 
 锁屏不等于系统睡眠：Mac 仍在运行，蓝牙重连、网络通道和通知都会继续工作。显示器仍可能按系统「显示器关闭时间」自动熄灭；那是显示器睡眠，不是系统睡眠。如果希望锁屏后屏幕保持点亮，需要调整系统设置 → 锁定屏幕 / 显示器关闭时间，而不是这个功能。
 
+### 7. 可选：按 App 设置弹窗或静默
+
+如果只想让微信、短信等少数 App 在 Mac 上弹横幅，其他 App 只留一条通知中心记录，可以按 App 分流：
+
+1. 点击菜单栏「通知桥」→「按 App 设置通知…」。
+2. 列表会列出升级后收到过通知的 App（显示 App 名称和 Android 包名）；把重要的 App 设为「弹窗」，其余设为「静默」。
+3. 「静默」不播放声音、不显示横幅，只把通知放进通知中心；「弹窗」仍按系统通知设置显示横幅或提醒。
+4. 规则只影响之后收到的通知，不会改已经显示的通知；「全部恢复为弹窗」可以一键清除所有规则。
+
+设置保存在 Mac 本机的通知桥偏好设置里，不上传，也不记录消息正文；只保存 App 名称、包名和规则。列表里暂时没有某个 App，说明升级后还没收到过它的通知，等它来一条通知后会自动出现，再设置即可。
+
+> 专注模式下，弹窗仍需要把「通知桥」加入该专注模式的允许通知；否则系统会把所有横幅都压到通知中心。静默通知不受影响，因为它本来就不弹横幅。这个功能解决的是“允许通知桥之后，所有 App 都一起弹”的问题，不能绕过专注模式本身。
+
 ---
 
 ## 验证状态
@@ -256,8 +272,9 @@ Mac 菜单里的「状态」会显示当前可用路径，例如「已连接：�
 已经在本机验证：
 
 - `swift build` 编译 macOS 端成功。
-- `swift run ProtocolSelfTest`：原有 BLE 帧/JSON 测试全部通过；新增 TCP 分帧、HKDF 跨语言向量、AES-GCM、嵌套通知 JSON、地址解析测试也全部通过；自动锁屏策略新增 12 项边界测试（共 85 项）。
+- `swift run ProtocolSelfTest`：原有 BLE 帧/JSON 测试全部通过；新增 TCP 分帧、HKDF 跨语言向量、AES-GCM、嵌套通知 JSON、地址解析测试也全部通过；自动锁屏策略新增 12 项边界测试；按 App 规则新增 13 项大小写、包名优先/App 回退、JSON 往返与恢复默认测试（共 96 项）。
 - macOS `.app` 打包、ad-hoc 签名和 `codesign --verify` 通过。
+- 0.2.5 按 App 分流：设置窗口布局和下拉切换冒烟测试通过；安装到 `/Applications` 后启动、连接手机并配对成功。
 - 0.2.4 自动锁屏：新增 RSSI 采样、宽限期、取消通知和菜单开关；`AutoLockPolicy` 的 12 项边界用例通过，`swift build` 成功。
 - 自动锁屏实际触发：本机日志已多次记录 `Auto-lock fired ... 已通过 loginwindow 锁定屏幕`，走的是屏幕锁定分支，不是 `pmset`/睡眠分支。
 - App 可启动，菜单栏进程正常，CoreBluetooth 进入 poweredOn 并开始扫描。
@@ -294,6 +311,7 @@ Mac 菜单里的「状态」会显示当前可用路径，例如「已连接：�
 
 尚未验证：
 
+- **按 App 弹窗/静默的真实链路尚未验证**：设置窗口已用隔离 AppKit 冒烟测试验证布局和下拉动作，但还没有从真实 App 菜单打开、点击切换，也没有用真实手机通知确认 `.passive` 在专注模式下的表现和不同 App 的包名稳定性。
 - **自动锁屏的实机边界仍需更多测试**：本机日志已多次走 `loginwindow` 锁屏分支（例如 2026-11-12 18:44），不是睡眠分支；但手机蓝牙关闭/杀 App 不误锁、Mac 睡眠不误锁、宽限期内重连取消等场景仍建议逐项验证。
 - **新版 Android APK 的局域网 / Tailscale / 云中转还没有在实体手机上跑过**；目前完成了 Android 15 模拟器 + `adb forward` 的 TCP 闭环，以及 Mac 端对模拟手机/模拟中继的端到端验证。真实 Wi-Fi、mDNS 跨设备发现、Tailscale ACL、4G/5G 切换仍需真机验证。
 - Android 云中转客户端只完成了编译和单元测试；Mac 云中转客户端已与真实 TLS 中继完成端到端验证。
@@ -447,6 +465,10 @@ ad-hoc 签名每次构建都会变化，macOS 会把它当成新的二进制重�
 3. 菜单状态应先变成「正在搜索附近的手机…」。
 4. 如果状态停在「正在连接…」超过十几秒，点菜单里的「重置蓝牙连接」；新版也会在超时后自动重置。
 
+### 怎么只让微信弹窗，其他 App 静默？
+
+菜单栏 →「按 App 设置通知…」，把微信设为「弹窗」，其他 App 设为「静默」。静默通知不会播放声音或显示横幅，只进通知中心；弹窗通知也仍然受专注模式约束，需要把「通知桥」加入专注模式的允许通知。详见「快速开始 → 7」。
+
 ### 通知只在通知中心，没有桌面横幅？
 
 如果 Mac 通知中心里能看到内容，说明通知已经成功投递。常见的“没有横幅”原因按顺序检查：
@@ -455,6 +477,7 @@ ad-hoc 签名每次构建都会变化，macOS 会把它当成新的二进制重�
 2. **专注模式/勿扰模式**：这是最常见原因。专注模式会把横幅延迟，只放进通知中心。打开控制中心检查当前是否有专注模式，关闭它，或把「通知桥」加入该专注模式的允许通知。
 3. 屏幕是否处于锁定/睡眠状态，以及通知设置中的锁屏显示选项。
 4. 菜单栏「通知权限」是否显示为「仅通知中心」；如果是，点进去修改样式。
+5. 菜单栏 →「按 App 设置通知…」里，这个 App 是否被设成了「静默」；静默是通知桥主动只投递到通知中心，不会出现横幅。
 
 本机日志可以直接看出来：如果出现 `muted by DND suppression: delay` / `Resolved event behavior ... interruptionSuppression: delay delivery`，就是专注模式拦截了横幅，不是通知桥没有发送。
 
@@ -495,7 +518,7 @@ android/                       Android 客户端（Kotlin，无第三方运行�
   app/src/main/java/...        Activity、通知监听、BLE 服务、TCP 服务、云客户端、帧/加密
 macos/                         macOS 接收端（Swift Package）
   Sources/NotifyBridgeCore/    BLE 帧协议、TCP 分帧、HKDF/AES-GCM
-  Sources/NotifyBridge/        菜单栏 App、CoreBluetooth、直连/云中转接收器、通知中心
+  Sources/NotifyBridge/        菜单栏 App、CoreBluetooth、直连/云中转接收器、按 App 通知规则、通知中心
   Sources/ProtocolSelfTest/    无 XCTest 依赖的协议自测
 server/                        自建 TLS 中继（Node.js，无 npm 依赖）
 scripts/build-macos.sh         构建 .app
@@ -523,7 +546,8 @@ dist/                          构建产物（.app/.dmg/.zip/.apk）
 - Windows/Linux 接收端（WinRT BLE / BlueZ）。
 - LE Secure Connections 或应用层 AES-GCM 加密。
 - 通知撤销同步（手机清除通知，Mac 同步移除）。
-- App 过滤、勿扰时段、快捷回复（Android RemoteInput）。
+- 勿扰时段、快捷回复（Android RemoteInput）。
+- 按 App 规则的手动添加/删除：当前列表只收集升级后收到过通知的 App，暂时不能手动添加还没来过通知的 App。
 - 开机自启、多设备记忆。
 - 把 Mac 端改为 Xcode 工程并做 Developer ID 签名/公证。
 

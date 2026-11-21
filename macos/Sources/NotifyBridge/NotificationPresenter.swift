@@ -66,12 +66,17 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    func deliver(_ message: WireMessage) {
+    func deliver(_ message: WireMessage, ignoringRules: Bool = false) {
         guard message.isNotification else { return }
 
         let appName = clean(message.app) ?? "手机通知"
         let sender = clean(message.title)
         let bodyText = clean(message.text) ?? "收到一条新通知"
+        // The rule is looked up for every notification, so changing a setting
+        // takes effect on the next message without restarting the app.
+        let deliveryMode = ignoringRules
+            ? NotificationDeliveryMode.banner
+            : NotificationPreferences.mode(package: message.pkg, app: message.app)
 
         let content = UNMutableNotificationContent()
         content.title = sender ?? appName
@@ -79,12 +84,12 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
             content.subtitle = appName
         }
         content.body = String(bodyText.prefix(2_000))
-        content.sound = .default
+        content.sound = deliveryMode == .silent ? nil : .default
         content.threadIdentifier = clean(message.pkg) ?? "notifybridge"
         if #available(macOS 12.0, *) {
-            content.interruptionLevel = .active
+            content.interruptionLevel = deliveryMode == .silent ? .passive : .active
         }
-        var info: [String: Any] = ["source": "notifybridge"]
+        var info: [String: Any] = ["source": "notifybridge", "delivery": deliveryMode.rawValue]
         if let app = message.app { info["app"] = app }
         if let pkg = message.pkg { info["package"] = pkg }
         if let time = message.time { info["phoneTime"] = time }
@@ -108,13 +113,15 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
             return
         }
 
+        NotificationCatalog.record(app: message.app, pkg: message.pkg)
+
         let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request) { error in
             if let error {
                 AppLogger.error("Unable to deliver notification: \(error.localizedDescription)")
             }
         }
-        AppLogger.info("Delivered notification from app=\(message.app ?? "?") pkg=\(message.pkg ?? "?")")
+        AppLogger.info("Delivered notification (mode=\(deliveryMode.rawValue)) from app=\(message.app ?? "?") pkg=\(message.pkg ?? "?")")
     }
 
     func deliverTestNotification() {
@@ -128,7 +135,7 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
             time: Int64(Date().timeIntervalSince1970 * 1000),
             category: "msg"
         )
-        deliver(message)
+        deliver(message, ignoringRules: true)
     }
 
     /// Shows the countdown warning before the screen locks. The action button
@@ -247,7 +254,13 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        if #available(macOS 11.0, *) {
+        let delivery = notification.request.content.userInfo["delivery"] as? String
+        if delivery == NotificationDeliveryMode.silent.rawValue {
+            // Passive notifications stay in Notification Center. Returning
+            // only .list also prevents a banner if the settings window happens
+            // to be frontmost when a silent notification arrives.
+            completionHandler([.list])
+        } else if #available(macOS 11.0, *) {
             completionHandler([.banner, .sound])
         } else {
             completionHandler([.alert, .sound])

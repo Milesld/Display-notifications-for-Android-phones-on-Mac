@@ -127,6 +127,32 @@ do {
 }
 
 do {
+    var rules = NotificationRuleSet()
+    check(rules.mode(package: "com.tencent.mm", app: "微信") == .banner, "unknown source defaults to banner")
+    check(rules.mode(package: nil, app: nil) == .banner, "missing source defaults to banner")
+
+    rules.setMode(.silent, package: "com.tencent.mm", app: "微信")
+    check(rules.mode(package: "COM.TENCENT.MM", app: nil) == .silent, "package rule is case-insensitive")
+    check(rules.mode(package: "com.example.other", app: "微信") == .banner, "package rule does not leak to other apps")
+    check(rules.mode(package: "com.example.other", app: "其他") == .banner, "unrelated source stays banner")
+
+    var appRules = NotificationRuleSet()
+    appRules.setMode(.silent, package: nil, app: "微信")
+    check(appRules.mode(package: nil, app: "微信") == .silent, "app-only rule matches")
+    check(appRules.mode(package: "com.example.other", app: "微信") == .silent, "app rule is a package fallback")
+
+    let encoded = try JSONEncoder().encode(rules)
+    let decoded = try JSONDecoder().decode(NotificationRuleSet.self, from: encoded)
+    check(decoded == rules, "rule set JSON round-trip")
+    check(decoded.mode(package: "com.tencent.mm", app: nil) == .silent, "decoded rule still applies")
+
+    rules.setMode(.banner, package: "com.tencent.mm", app: "微信")
+    check(rules.mode(package: "com.tencent.mm", app: "微信") == .banner, "banner removes the package rule")
+    appRules.setMode(.banner, package: nil, app: "微信")
+    check(appRules.isEmpty, "removing the app rule empties the set")
+}
+
+do {
     let androidJSON = #"{"v":1,"type":"notification","id":"0|com.tencent.mm|12345|null|10123:1700000000000","app":"微信","pkg":"com.tencent.mm","time":1700000000000,"title":"张三","text":"晚上吃饭吗？","category":"msg"}"#
     let message = try JSONDecoder().decode(WireMessage.self, from: Data(androidJSON.utf8))
     check(message.isNotification, "Android notification JSON decodes")
