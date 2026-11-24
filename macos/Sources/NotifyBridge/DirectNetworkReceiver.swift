@@ -2,15 +2,13 @@ import Foundation
 import Network
 import NotifyBridgeCore
 
-/// Direct TCP transport. It covers two physical paths with the same protocol:
+/// Direct TCP transport over the local Wi-Fi/LAN network. The phone advertises
+/// itself with Bonjour as `_notifybridge._tcp`; the Mac connects to the
+/// discovered endpoint.
 ///
-/// - LAN: Bonjour discovery of `_notifybridge._tcp` on the local network.
-/// - Remote: a manually configured Tailscale/MagicDNS (or other reachable)
-///   host, used when Bonjour has no result.
-///
-/// The receiver keeps trying independently of BLE and the cloud relay. The
-/// presenter deduplicates identical notifications, so more than one live path
-/// is safe and the fastest one wins.
+/// The receiver keeps trying independently of BLE. The presenter deduplicates
+/// identical notifications, so more than one live path is safe and the fastest
+/// one wins.
 final class DirectNetworkReceiver {
     var onMessage: ((WireMessage) -> Void)?
     var onStatusChange: ((String) -> Void)?
@@ -39,10 +37,8 @@ final class DirectNetworkReceiver {
     private var lastReceive = Date()
     private var handshakeWork: DispatchWorkItem?
     private var reconnectWork: DispatchWorkItem?
-    private var manualWork: DispatchWorkItem?
     private var heartbeat: DispatchSourceTimer?
     private var backoffIndex = 0
-    private var forceManual = false
 
     private let backoffDelays: [TimeInterval] = [2, 5, 15, 30, 60, 120]
 
@@ -52,16 +48,11 @@ final class DirectNetworkReceiver {
         queue.async { [weak self] in
             guard let self, !self.started else { return }
             self.started = true
-            if !NetworkSettings.directEnabled {
-                self.setStatus("网络：已关闭")
-                return
-            }
             self.results = []
             self.savedPin = PairingVault.loadPin()
             self.lastSeq = NetworkSettings.directLastSeq
             self.setStatus("网络：正在搜索…")
             self.startBrowser()
-            self.scheduleManualFallback(after: 2.5)
             if self.savedPin == nil {
                 self.setStatus("网络：需要先通过蓝牙配对")
             }
@@ -75,8 +66,6 @@ final class DirectNetworkReceiver {
             self.cancelTimers()
             self.reconnectWork?.cancel()
             self.reconnectWork = nil
-            self.manualWork?.cancel()
-            self.manualWork = nil
             self.browser?.cancel()
             self.browser = nil
             self.results = []
@@ -96,25 +85,16 @@ final class DirectNetworkReceiver {
             self.cancelTimers()
             self.reconnectWork?.cancel()
             self.reconnectWork = nil
-            self.manualWork?.cancel()
-            self.manualWork = nil
             self.browser?.cancel()
             self.browser = nil
             self.closeConnection()
             self.results = []
             self.backoffIndex = 0
-            self.forceManual = false
             self.started = true
             self.savedPin = PairingVault.loadPin()
             self.lastSeq = NetworkSettings.directLastSeq
-            guard NetworkSettings.directEnabled else {
-                self.setStatus("网络：已关闭")
-                self.publishFlags(connected: false, paired: false)
-                return
-            }
             self.setStatus("网络：正在搜索…")
             self.startBrowser()
-            self.scheduleManualFallback(after: 2.5)
             if self.savedPin == nil {
                 self.setStatus("网络：需要先通过蓝牙配对")
             } else {
@@ -129,7 +109,6 @@ final class DirectNetworkReceiver {
             self.reconnectWork?.cancel()
             self.reconnectWork = nil
             self.backoffIndex = 0
-            self.forceManual = false
             self.closeConnection()
             self.attemptCandidates()
         }
@@ -184,7 +163,7 @@ final class DirectNetworkReceiver {
                 self.lastError = error.localizedDescription
                 AppLogger.error("Bonjour browser failed: \(error.localizedDescription)")
                 if !self.sessionPaired {
-                    self.setStatus("网络：局域网发现不可用，等待远程地址")
+                    self.setStatus("网络：局域网发现不可用")
                 }
             case .waiting(let error):
                 AppLogger.info("Bonjour browser waiting: \(error.localizedDescription)")
@@ -222,40 +201,32 @@ final class DirectNetworkReceiver {
     // MARK: - Connecting
 
     private func attemptCandidates() {
-        guard started, NetworkSettings.directEnabled, connection == nil else { return }
+        guard started, connection == nil else { return }
         guard let pin = savedPin ?? PairingVault.loadPin() else {
             setStatus("网络：需要先通过蓝牙配对")
             return
         }
         savedPin = pin
 
-        if !forceManual, let result = preferredResult() {
-            connect(to: result.endpoint, path: "局域网")
-            return
-        }
-        if let target = NetworkSettings.directTarget {
-            connect(to: .hostPort(host: NWEndpoint.Host(target.host), port: NWEndpoint.Port(rawValue: target.port)!), path: "远程直连")
-            return
-        }
         if let result = preferredResult() {
-            connect(to: result.endpoint, path: "局域网")
+            connect(to: result.endpoint)
             return
         }
 
-        setStatus("网络：等待手机出现在局域网，或在设置中填写远程地址")
+        setStatus("网络：等待手机出现在局域网")
         scheduleRetry(after: 15)
     }
 
-    private func connect(to endpoint: NWEndpoint, path: String) {
+    private func connect(to endpoint: NWEndpoint) {
         guard connection == nil, openedPin() != nil else { return }
         let parameters = NWParameters.tcp
         parameters.includePeerToPeer = true
         let connection = NWConnection(to: endpoint, using: parameters)
         self.connection = connection
         self.buffer.removeAll(keepingCapacity: true)
-        self.pathName = path
+        self.pathName = "局域网"
         self.lastReceive = Date()
-        setStatus("\(path)：正在连接…")
+        setStatus("\(pathName)：正在连接…")
 
         connection.stateUpdateHandler = { [weak self] state in
             guard let self, self.connection === connection else { return }
@@ -263,7 +234,7 @@ final class DirectNetworkReceiver {
             case .ready:
                 self.beginSession()
             case .waiting(let error):
-                AppLogger.info("Direct connection waiting (\(path)): \(error.localizedDescription)")
+                AppLogger.info("Direct connection waiting: \(error.localizedDescription)")
             case .failed(let error):
                 self.lastError = error.localizedDescription
                 self.handleFailure("连接失败：\(error.localizedDescription)")
@@ -315,19 +286,6 @@ final class DirectNetworkReceiver {
         }
         handshakeWork = work
         queue.asyncAfter(deadline: .now() + 15, execute: work)
-    }
-
-    private func scheduleManualFallback(after delay: TimeInterval) {
-        guard NetworkSettings.directTarget != nil else { return }
-        manualWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, self.started, self.connection == nil, self.savedPin != nil else { return }
-            if self.preferredResult() == nil {
-                self.attemptCandidates()
-            }
-        }
-        manualWork = work
-        queue.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     // MARK: - Receive
@@ -402,7 +360,6 @@ final class DirectNetworkReceiver {
         handshakeWork?.cancel()
         handshakeWork = nil
         backoffIndex = 0
-        forceManual = false
         sessionConnected = true
         sessionPaired = true
         publishFlags(connected: true, paired: true)
@@ -493,11 +450,6 @@ final class DirectNetworkReceiver {
         publishFlags(connected: false, paired: false)
         let delay = backoffDelays[min(backoffIndex, backoffDelays.count - 1)]
         backoffIndex = min(backoffIndex + 1, backoffDelays.count - 1)
-        if pathName == "远程直连" {
-            forceManual = false
-        } else {
-            forceManual = NetworkSettings.directTarget != nil
-        }
         setStatus("网络：\(reason)，\(Int(delay)) 秒后重试")
         scheduleRetry(after: delay)
     }

@@ -2,11 +2,8 @@ package com.notifybridge.app
 
 import android.Manifest
 import android.app.Activity
-import android.app.AlertDialog
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -17,13 +14,9 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import android.service.notification.NotificationListenerService
-import android.text.InputType
 import android.util.Log
 import android.view.View
 import android.widget.Button
-import android.widget.CheckBox
-import android.widget.EditText
-import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -49,8 +42,6 @@ class MainActivity : Activity() {
     private lateinit var testPhoneButton: Button
     private lateinit var macHint: TextView
     private lateinit var lanStatus: TextView
-    private lateinit var cloudStatus: TextView
-    private lateinit var networkSettingsButton: Button
 
     private val handler = Handler(Looper.getMainLooper())
     private var pendingStart = false
@@ -68,6 +59,7 @@ class MainActivity : Activity() {
     @Suppress("DEPRECATION")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        LegacySettings.purge(this)
         window.statusBarColor = getColor(R.color.background)
         window.navigationBarColor = getColor(R.color.background)
         window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
@@ -87,8 +79,6 @@ class MainActivity : Activity() {
         testPhoneButton = findViewById(R.id.test_phone_button)
         macHint = findViewById(R.id.mac_hint)
         lanStatus = findViewById(R.id.lan_status)
-        cloudStatus = findViewById(R.id.cloud_status)
-        networkSettingsButton = findViewById(R.id.network_settings_button)
 
         notificationButton.setOnClickListener {
             if (isNotificationAccessEnabled() && !RelayState.listenerConnected) {
@@ -100,7 +90,6 @@ class MainActivity : Activity() {
         startStopButton.setOnClickListener { toggleRelay() }
         refreshPinButton.setOnClickListener { refreshPairingCode() }
         testPhoneButton.setOnClickListener { sendTestMessage() }
-        networkSettingsButton.setOnClickListener { showNetworkSettings() }
     }
 
     override fun onResume() {
@@ -165,17 +154,15 @@ class MainActivity : Activity() {
 
         connectionStatus.text = when {
             !RelayState.isRunning -> getString(R.string.connection_not_running)
-            RelayState.paired && RelayState.networkPaired -> getString(R.string.connection_paired_both)
+            RelayState.paired && RelayState.lanPaired -> getString(R.string.connection_paired_both)
             RelayState.paired -> getString(R.string.connection_paired)
-            RelayState.networkPaired -> getString(R.string.connection_network_paired)
+            RelayState.lanPaired -> getString(R.string.connection_network_paired)
             RelayState.centralConnected -> getString(R.string.connection_waiting_for_pin)
             else -> getString(R.string.connection_waiting_for_mac)
         }
 
         lanStatus.text = RelayState.lanState
-        cloudStatus.text = RelayState.cloudState
         lanStatus.setTextColor(if (RelayState.isRunning) getColor(R.color.text_secondary) else getColor(R.color.muted))
-        cloudStatus.setTextColor(if (RelayState.cloudConnected) getColor(R.color.success) else getColor(R.color.text_secondary))
 
         val btText = RelayState.bluetoothState
         bluetoothState.text = getString(R.string.bluetooth_state_format, btText)
@@ -256,7 +243,7 @@ class MainActivity : Activity() {
             toast(getString(R.string.toast_start_first))
             return
         }
-        if (!RelayState.paired && !RelayState.networkPaired) {
+        if (!RelayState.paired && !RelayState.lanPaired) {
             toast(getString(R.string.toast_pair_first))
             return
         }
@@ -277,138 +264,6 @@ class MainActivity : Activity() {
         } catch (e: Exception) {
             toast(getString(R.string.toast_refresh_failed))
         }
-    }
-
-    private fun showNetworkSettings() {
-        val density = resources.displayMetrics.density
-        fun dp(value: Int) = (value * density).toInt()
-
-        val layout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(8), dp(20), dp(8))
-        }
-
-        fun addLabel(text: String, top: Int = 12) {
-            layout.addView(TextView(this).apply {
-                this.text = text
-                textSize = 12f
-                setTextColor(getColor(R.color.muted))
-                setPadding(0, dp(top), 0, dp(2))
-            })
-        }
-
-        fun addField(value: String, hint: String): EditText {
-            return EditText(this).apply {
-                setText(value)
-                this.hint = hint
-                textSize = 14f
-                setSingleLine(true)
-                setHorizontallyScrolling(true)
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                )
-            }.also { layout.addView(it) }
-        }
-
-        layout.addView(TextView(this).apply {
-            text = getString(R.string.network_dialog_hint)
-            textSize = 13f
-            setTextColor(getColor(R.color.text_secondary))
-            setLineSpacing(0f, 1.15f)
-            setPadding(0, 0, 0, dp(4))
-        })
-        layout.addView(TextView(this).apply {
-            text = getString(R.string.network_lan_note)
-            textSize = 12f
-            setTextColor(getColor(R.color.muted))
-            setPadding(0, dp(6), 0, 0)
-        })
-
-        addLabel(getString(R.string.relay_target_label))
-        val targetField = addField(
-            NetworkPrefs.relayTarget(this),
-            getString(R.string.relay_target_hint)
-        )
-
-        addLabel(getString(R.string.relay_secret_label))
-        val secretField = addField(
-            NetworkPrefs.relaySecret(this),
-            getString(R.string.relay_secret_hint)
-        ).apply {
-            setTextIsSelectable(true)
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
-        }
-
-        val buttons = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(0, dp(8), 0, 0)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            )
-        }
-        buttons.addView(Button(this).apply {
-            text = getString(R.string.relay_generate)
-            setOnClickListener { secretField.setText(NetCrypto.generateSecret()) }
-        })
-        buttons.addView(Button(this).apply {
-            text = getString(R.string.relay_copy)
-            setOnClickListener { copyRelaySecret(secretField.text.toString()) }
-        })
-        layout.addView(buttons)
-
-        val enabled = CheckBox(this).apply {
-            text = getString(R.string.relay_enable)
-            isChecked = NetworkPrefs.isCloudEnabled(this@MainActivity)
-            setPadding(0, dp(8), 0, 0)
-        }
-        layout.addView(enabled)
-
-        val scroll = ScrollView(this).apply {
-            addView(layout)
-        }
-        val dialog = AlertDialog.Builder(this)
-            .setTitle(R.string.network_dialog_title)
-            .setView(scroll)
-            .setPositiveButton(android.R.string.ok, null)
-            .setNegativeButton(android.R.string.cancel, null)
-            .create()
-
-        dialog.setOnShowListener {
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                val target = targetField.text.toString().trim()
-                val secret = secretField.text.toString().trim()
-                if (enabled.isChecked) {
-                    if (RelayTarget.parse(target, 443) == null) {
-                        toast(getString(R.string.relay_invalid_target))
-                        return@setOnClickListener
-                    }
-                    if (NetCrypto.decodeSecret(secret) == null) {
-                        toast(getString(R.string.relay_invalid_secret))
-                        return@setOnClickListener
-                    }
-                }
-                NetworkPrefs.saveCloud(this, enabled.isChecked, target, secret)
-                if (RelayState.isRunning) {
-                    startService(
-                        Intent(this, NotificationRelayService::class.java)
-                            .setAction(NotificationRelayService.ACTION_RELOAD_NETWORK)
-                    )
-                }
-                dialog.dismiss()
-                toast(getString(R.string.relay_saved))
-                refreshUi()
-            }
-        }
-        dialog.show()
-    }
-
-    private fun copyRelaySecret(value: String) {
-        if (value.isBlank()) return
-        val clipboard = getSystemService(ClipboardManager::class.java)
-        clipboard.setPrimaryClip(ClipData.newPlainText("NotifyBridge relay secret", value))
-        toast(getString(R.string.relay_copied))
     }
 
     /** The pairing card is below the fold on small screens; bring it up when

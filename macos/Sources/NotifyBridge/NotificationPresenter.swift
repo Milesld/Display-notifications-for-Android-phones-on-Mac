@@ -16,7 +16,7 @@ final class NotificationPresenter: NSObject, UNUserNotificationCenterDelegate {
 
     private let deliveryLock = NSLock()
     private var recentDeliveries: [String: Date] = [:]
-    /// A notification can arrive over BLE, LAN and the relay almost at once.
+    /// A notification can arrive over BLE and LAN almost at once.
     /// The phone's stable id plus post time is identical on every path, so it
     /// is a reliable cross-transport dedupe key while still letting a genuine
     /// update (new post time) through.

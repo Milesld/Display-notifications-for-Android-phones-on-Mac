@@ -6,6 +6,7 @@ import android.net.Network
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -19,6 +20,7 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
+import java.security.MessageDigest
 import java.util.ArrayDeque
 import java.util.Locale
 import java.util.UUID
@@ -29,10 +31,10 @@ import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
 /**
- * Direct TCP server used for both LAN and Tailscale paths. The phone stays the
- * server (matching the BLE role model); the Mac connects to port 47821. The
- * server advertises itself with Bonjour so a Mac on the same Wi-Fi can find it
- * without configuration; a Tailscale address is entered manually on the Mac.
+ * Direct TCP server for the Wi-Fi/LAN channel. The phone stays the server
+ * (matching the BLE role model); the Mac connects to port 47821. The server
+ * advertises itself with Bonjour so a Mac on the same Wi-Fi can find it
+ * without any manual configuration.
  *
  * The BLE service and its state are completely independent of this class.
  */
@@ -148,10 +150,6 @@ class LanRelayServer(
         Log.i(TAG, "LAN relay server stopped")
     }
 
-    fun updatePin() {
-        // Pin is read from the provider for every authentication attempt.
-    }
-
     /**
      * Called for every notification that reaches the relay service, whether or
      * not BLE is paired. History lets a Mac that reconnects catch up; the Mac's
@@ -234,7 +232,7 @@ class LanRelayServer(
                     .put("deviceId", DeviceIdentity.bytes(context).joinToString("") {
                         String.format(Locale.US, "%02X", it.toInt() and 0xFF)
                     })
-                    .put("name", NetworkPrefs.deviceName())
+                    .put("name", deviceName())
                     .put("session", session)
                     .toString()
             )
@@ -286,7 +284,7 @@ class LanRelayServer(
             return
         }
         val supplied = json.optString("pin", "")
-        if (!NetCrypto.pinEquals(pinProvider(), supplied)) {
+        if (!pinEquals(pinProvider(), supplied)) {
             recordFailure(address)
             client.failedAttempts += 1
             client.send(
@@ -397,7 +395,7 @@ class LanRelayServer(
             serviceType = SERVICE_TYPE
             port = PORT
             setAttribute("id", id)
-            setAttribute("name", NetworkPrefs.deviceName())
+            setAttribute("name", deviceName())
         }
         val listener = object : NsdManager.RegistrationListener {
             override fun onServiceRegistered(serviceInfo: NsdServiceInfo) {
@@ -494,6 +492,14 @@ class LanRelayServer(
         }
         wifiLock = null
     }
+
+    private fun deviceName(): String = Build.MODEL.ifBlank { "Android" }
+
+    /** Constant-time comparison so a failed pairing attempt leaks no prefix timing. */
+    private fun pinEquals(expected: String, supplied: String): Boolean = MessageDigest.isEqual(
+        expected.toByteArray(Charsets.UTF_8),
+        supplied.toByteArray(Charsets.UTF_8)
+    )
 
     private inner class Client(val socket: Socket) {
         val input = DataInputStream(BufferedInputStream(socket.getInputStream()))

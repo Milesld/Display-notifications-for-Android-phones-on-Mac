@@ -49,7 +49,6 @@ class NotificationRelayService : Service() {
         private const val TAG = "NotifyBridge"
         const val ACTION_STOP = "com.notifybridge.app.action.STOP"
         const val ACTION_REFRESH_PIN = "com.notifybridge.app.action.REFRESH_PIN"
-        const val ACTION_RELOAD_NETWORK = "com.notifybridge.app.action.RELOAD_NETWORK"
 
         private const val CHANNEL_ID = "notifybridge.relay"
         private const val NOTIFICATION_ID = 1001
@@ -86,7 +85,7 @@ class NotificationRelayService : Service() {
     private var subscribeTimeoutRunnable: Runnable? = null
     private var advertiseRetryDelayMs = 5_000L
     @Volatile private var advertiseStableIdInMainPacket = true
-    private var networkRelay: NetworkRelayManager? = null
+    private var lanRelay: LanRelayServer? = null
     private var lastListenerConnected: Boolean? = null
 
     private val incomingReassembler = FrameReassembler()
@@ -103,6 +102,7 @@ class NotificationRelayService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        LegacySettings.purge(this)
         destroyed = false
         notificationManager = getSystemService(NotificationManager::class.java)
         bluetoothManager = getSystemService(BluetoothManager::class.java)
@@ -122,7 +122,7 @@ class NotificationRelayService : Service() {
             stopSelf()
             return
         }
-        startNetworkRelay()
+        startLanRelay()
         startGattServer()
         mainHandler.postDelayed(listenerWatchdog, 15_000)
         mainHandler.postDelayed(advertisingWatchdog, ADVERTISING_WATCHDOG_INTERVAL_MS)
@@ -137,12 +137,7 @@ class NotificationRelayService : Service() {
             ACTION_REFRESH_PIN -> {
                 pin = PinStore.refresh(this)
                 failedAttempts = 0
-                networkRelay?.updatePin()
                 setBluetoothState("配对码已刷新")
-                updateForegroundNotification()
-            }
-            ACTION_RELOAD_NETWORK -> {
-                networkRelay?.reload()
                 updateForegroundNotification()
             }
         }
@@ -150,7 +145,7 @@ class NotificationRelayService : Service() {
         if (!RelayState.isRunning) {
             RelayState.isRunning = true
             startForegroundCompat()
-            startNetworkRelay()
+            startLanRelay()
             startGattServer()
         } else {
             updateForegroundNotification()
@@ -166,12 +161,10 @@ class NotificationRelayService : Service() {
         RelayState.centralConnected = false
         RelayState.paired = false
         RelayState.bluetoothState = "已停止"
-        networkRelay?.stop()
-        networkRelay = null
+        lanRelay?.stop()
+        lanRelay = null
         RelayState.lanState = "局域网：已停止"
         RelayState.lanClients = 0
-        RelayState.cloudState = "云中转：未配置"
-        RelayState.cloudConnected = false
         NotificationHub.setSink(null)
         mainHandler.removeCallbacks(listenerWatchdog)
         mainHandler.removeCallbacks(advertisingWatchdog)
@@ -506,11 +499,11 @@ class NotificationRelayService : Service() {
         )
 
         val text = when {
-            isPaired && RelayState.networkPaired -> "已连接 Mac（蓝牙 + 网络），通知会实时同步"
+            isPaired && RelayState.lanPaired -> "已连接 Mac（蓝牙 + 局域网），通知会实时同步"
             isPaired -> "已连接 Mac（蓝牙），通知会实时同步"
-            RelayState.networkPaired -> "已连接 Mac（网络），通知会实时同步"
+            RelayState.lanPaired -> "已连接 Mac（局域网），通知会实时同步"
             RelayState.centralConnected -> "Mac 已连接，请在手机 App 中输入配对码"
-            else -> "等待 Mac 连接（蓝牙 / 网络）· 配对码见 App"
+            else -> "等待 Mac 连接（蓝牙 / 局域网）· 配对码见 App"
         }
 
         return Notification.Builder(this, CHANNEL_ID)
@@ -1028,24 +1021,26 @@ class NotificationRelayService : Service() {
     }
 
     private fun publish(json: String) {
-        // Network channels are independent of BLE. They keep working while the
-        // phone is out of Bluetooth range or the Mac is remote.
-        networkRelay?.publish(json)
+        // The Wi-Fi/LAN channel is independent of BLE. It keeps working while
+        // the phone is out of Bluetooth range.
+        lanRelay?.publish(json)
         if (!isPaired || !isSubscribed || connectedDevice == null) return
         enqueue(json, requirePaired = true)
     }
 
-    private fun startNetworkRelay() {
-        if (networkRelay != null) return
-        val manager = NetworkRelayManager(
+    private fun startLanRelay() {
+        if (lanRelay != null) return
+        val server = LanRelayServer(
             this,
             { pin },
             { isNotificationAccessEnabled() && RelayState.listenerConnected }
-        ) {
+        ) { state, clients ->
+            RelayState.lanState = state
+            RelayState.lanClients = clients
             mainHandler.post { updateForegroundNotification() }
         }
-        networkRelay = manager
-        manager.start()
+        lanRelay = server
+        server.start()
     }
 
     private fun sendStatus(state: String, detail: String?) {

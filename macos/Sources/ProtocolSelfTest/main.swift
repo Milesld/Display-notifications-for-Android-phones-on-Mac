@@ -224,28 +224,6 @@ do {
 }
 
 do {
-    let secret = RelayCrypto.decodeSecret("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8")
-    check(secret?.count == 32, "relay secret decodes")
-    if let secret {
-        check(RelayCrypto.channel(secret) == "5f288a7a29b15429de3c7a991d40548d", "HKDF channel vector")
-        check(RelayCrypto.token(secret) == "lF8N7GQrFKxTEng0pmO7zA2hKWauQLguOOwH2eZdKKM", "HKDF token vector")
-        check(
-            RelayCrypto.derive(secret, info: "enc", count: 32).base64URLEncodedString()
-                == "d7_iqFy5Lq20DaDM65mP85vOdN1qmT77af5WkTI67Tw",
-            "HKDF encryption vector"
-        )
-        let aad = Data("channel-aad".utf8)
-        let plaintext = "微信消息：今晚一起吃饭吗？🍜"
-        if let encrypted = try? RelayCrypto.encrypt(plaintext, secret: secret, aad: aad) {
-            check((try? RelayCrypto.decrypt(encrypted, secret: secret, aad: aad)) == plaintext, "relay AES-GCM round-trip")
-            check((try? RelayCrypto.decrypt(encrypted, secret: secret, aad: Data("other".utf8))) == nil, "relay AES-GCM rejects wrong AAD")
-        } else {
-            check(false, "relay AES-GCM encrypt")
-        }
-    }
-}
-
-do {
     var policy = SessionRebuildPolicy()
     let t0 = Date(timeIntervalSince1970: 1_700_000_000)
     check(!policy.noteStall(at: t0), "one stalled connect does not rebuild the session")
@@ -257,13 +235,6 @@ do {
     check(policy.noteStall(at: t0.addingTimeInterval(70)), "rebuild allowed again after the cooldown")
     policy.noteSuccess()
     check(policy.consecutiveStalls == 0, "a successful connection clears the stalls")
-}
-
-do {
-    check(RelayTarget.parse("example.com", defaultPort: 443) == RelayTarget(host: "example.com", port: 443), "target default port")
-    check(RelayTarget.parse("example.com:8443", defaultPort: 443) == RelayTarget(host: "example.com", port: 8443), "target custom port")
-    check(RelayTarget.parse("[::1]:47821", defaultPort: 443) == RelayTarget(host: "::1", port: 47821), "target IPv6")
-    check(RelayTarget.parse("", defaultPort: 443) == nil, "target empty")
 }
 
 do {
